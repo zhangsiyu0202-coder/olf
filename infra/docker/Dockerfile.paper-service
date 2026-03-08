@@ -1,0 +1,19 @@
+FROM python:3.11-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+ENV PIP_NO_CACHE_DIR=1
+ENV PAPER_SERVICE_CACHE_ROOT=/app/.runtime/paper-service-cache
+
+WORKDIR /app
+
+COPY apps/paper-service/requirements.txt /tmp/requirements.txt
+RUN pip install --upgrade pip \
+  && pip install -r /tmp/requirements.txt
+
+COPY apps ./apps
+COPY packages ./packages
+
+EXPOSE 8090
+
+CMD ["uvicorn", "main:app", "--app-dir", "apps/paper-service", "--host", "0.0.0.0", "--port", "8090"]

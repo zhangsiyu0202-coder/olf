@@ -4,9 +4,9 @@
   "version": "0.1.0",
   "type": "module",
   "scripts": {
-    "dev": "vite --host 127.0.0.1 --port 5173",
+    "dev": "sh -c 'vite --host \"${WEB_HOST:-127.0.0.1}\" --port \"${WEB_PORT:-5173}\"'",
     "build": "tsc --noEmit && vite build",
-    "preview": "vite preview --host 127.0.0.1 --port 4173"
+    "preview": "sh -c 'vite preview --host \"${WEB_HOST:-127.0.0.1}\" --port \"${WEB_PREVIEW_PORT:-4173}\"'"
   },
   "dependencies": {
     "@codemirror/autocomplete": "^6.18.6",

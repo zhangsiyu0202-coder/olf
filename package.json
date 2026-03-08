@@ -14,14 +14,18 @@
   },
   "scripts": {
     "start": "node apps/api/src/server.js",
-    "dev:api": "node apps/api/src/server.js",
-    "dev:paper-service": ".venv/bin/uvicorn main:app --app-dir apps/paper-service --host 127.0.0.1 --port 8090",
+    "dev:api": "sh -c 'PORT=\"${API_PORT:-3000}\" node apps/api/src/server.js'",
+    "dev:paper-service": "sh -c '.venv/bin/uvicorn main:app --app-dir apps/paper-service --host \"${PAPER_SERVICE_BIND_HOST:-127.0.0.1}\" --port \"${PAPER_SERVICE_PORT:-8090}\"'",
     "dev:web": "npm run dev --workspace @overleaf-clone/web",
     "dev:worker": "node workers/compiler/src/worker.js",
     "dev:worker:docker": "COMPILE_EXECUTION_MODE=docker node workers/compiler/src/worker.js",
+    "dev:stack": "bash scripts/dev-stack.sh",
     "build:web": "npm run build --workspace @overleaf-clone/web",
     "test:smoke": "node scripts/smoke-test.js",
     "test:smoke:local-ai": "AI_API_KEY= AI_BASE_URL= node scripts/smoke-test.js",
+    "docker:up": "docker compose -f infra/docker-compose.app.yml up -d --build",
+    "docker:down": "docker compose -f infra/docker-compose.app.yml down",
+    "docker:logs": "docker compose -f infra/docker-compose.app.yml logs -f",
     "platform:up": "docker compose --env-file infra/platform.env.example -f infra/docker-compose.platform.yml up -d",
     "platform:down": "docker compose --env-file infra/platform.env.example -f infra/docker-compose.platform.yml down"
   }

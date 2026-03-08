@@ -1,0 +1,25 @@
+FROM node:20-bookworm-slim AS build
+
+WORKDIR /app
+
+COPY package*.json ./
+COPY apps ./apps
+COPY packages ./packages
+COPY workers ./workers
+COPY scripts ./scripts
+
+RUN npm ci
+RUN npm run build:web
+
+FROM node:20-bookworm-slim
+
+WORKDIR /app
+
+ENV NODE_ENV=production
+ENV PORT=3000
+
+COPY --from=build /app /app
+
+EXPOSE 3000
+
+CMD ["node", "apps/api/src/server.js"]

@@ -49,6 +49,7 @@ docs/
 - [成品化阶段路线](./docs/product-phase.md)
 - [论文多源检索设计](./docs/paper-search-architecture.md)
 - [论文搜索服务部署指南](./docs/paper-service-deployment.md)
+- [Docker 部署指南](./docs/docker-deployment.md)
 - [Agent 协作规范](./AGENTS.md)
 - [MVP 规格](./.kiro/specs/overleaf-mvp/requirements.md)
 
@@ -138,12 +139,13 @@ docs/
 ## 本地运行
 
 1. 安装依赖：`npm install`
-2. 启动 API 服务：`npm run dev:api`
-3. 如需本地调试独立论文搜索服务：`npm run dev:paper-service`
-4. 启动编译 Worker：`npm run dev:worker`
-5. 若要使用 Docker 隔离编译：`npm run dev:worker:docker`
-6. 前端开发模式：`npm run dev:web`
-7. 打开 `http://127.0.0.1:5173`
+2. 如需一键拉起本地联调栈：`npm run dev:stack`
+3. 若需手工分开启动：
+   - API：`npm run dev:api`
+   - 论文服务：`npm run dev:paper-service`
+   - Worker：`npm run dev:worker`
+   - Web：`npm run dev:web`
+4. 打开 `http://127.0.0.1:5173`
 
 如果你要通过 API 服务直接托管前端产物：
 
@@ -166,11 +168,23 @@ docs/
 - 首次启用正式认证前，需确保目标数据库已创建 `pgcrypto` 扩展；当前本地 `overleaf` 数据库已完成该初始化。
 - Blob 后端可通过 `RUNTIME_BLOB_BACKEND=file|s3` 切换；启用 `s3` 时需配置 MinIO/S3 兼容参数。
 - 本仓库已提供 `npm run platform:up` 启动 PostgreSQL + MinIO。
+- 当前前端开发代理已支持跟随 `API_PORT` 或 `VITE_API_PROXY_TARGET`，不会再固定写死到 `3000`。
 - Worker 支持 `COMPILE_EXECUTION_MODE=host|docker`；`docker` 模式下会尝试使用 `COMPILE_DOCKER_IMAGE` 进行隔离编译。
 - 若仅想验证本地链路，不依赖远端 AI，可运行 `npm run test:smoke:local-ai`。
 - 当前宿主机编译已优先走 `latexmk`，若不可用才回退到多次引擎执行。
 - 当前阶段前端已经切换到 React 工作台，不再维护旧的原生 DOM 版本。
 - 当前阶段正式登录、工作空间、对象存储适配、多 worker 编译调度、`fileId` 协作主键、评论批注和编译缓存也已完成。
+
+## Docker 运行
+
+如果你希望用容器把主站、论文服务、数据库、对象存储和编译 Worker 一起跑起来：
+
+1. 准备环境变量：`cp .env.example .env`
+2. 按需填写 `AI_API_KEY`
+3. 启动整站：`npm run docker:up`
+4. 打开 `http://127.0.0.1:3000`
+
+更完整的说明见 [Docker 部署指南](./docs/docker-deployment.md)。
 
 ### 本地 PostgreSQL 说明
 

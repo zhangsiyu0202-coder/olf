@@ -1,0 +1,33 @@
+FROM node:20-bookworm-slim
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV NODE_ENV=production
+ENV COMPILE_EXECUTION_MODE=host
+
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    git \
+    latexmk \
+    texlive-bibtex-extra \
+    texlive-fonts-recommended \
+    texlive-latex-base \
+    texlive-latex-extra \
+    texlive-latex-recommended \
+    texlive-luatex \
+    texlive-publishers \
+    texlive-science \
+    texlive-xetex \
+  && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+COPY package*.json ./
+COPY apps ./apps
+COPY packages ./packages
+COPY workers ./workers
+COPY scripts ./scripts
+
+RUN npm ci
+
+CMD ["node", "workers/compiler/src/worker.js"]
