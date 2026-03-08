@@ -1,0 +1,6 @@
+{
+  "name": "@overleaf-clone/authentication",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module"
+}

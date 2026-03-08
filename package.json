@@ -1,0 +1,28 @@
+{
+  "name": "overleaf-clone",
+  "private": true,
+  "version": "0.1.0",
+  "packageManager": "npm@10.9.4",
+  "type": "module",
+  "workspaces": [
+    "apps/*",
+    "workers/*",
+    "packages/*"
+  ],
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "scripts": {
+    "start": "node apps/api/src/server.js",
+    "dev:api": "node apps/api/src/server.js",
+    "dev:paper-service": ".venv/bin/uvicorn main:app --app-dir apps/paper-service --host 127.0.0.1 --port 8090",
+    "dev:web": "npm run dev --workspace @overleaf-clone/web",
+    "dev:worker": "node workers/compiler/src/worker.js",
+    "dev:worker:docker": "COMPILE_EXECUTION_MODE=docker node workers/compiler/src/worker.js",
+    "build:web": "npm run build --workspace @overleaf-clone/web",
+    "test:smoke": "node scripts/smoke-test.js",
+    "test:smoke:local-ai": "AI_API_KEY= AI_BASE_URL= node scripts/smoke-test.js",
+    "platform:up": "docker compose --env-file infra/platform.env.example -f infra/docker-compose.platform.yml up -d",
+    "platform:down": "docker compose --env-file infra/platform.env.example -f infra/docker-compose.platform.yml down"
+  }
+}

@@ -1,0 +1,12 @@
+{
+  "name": "@overleaf-clone/collaboration",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "dependencies": {
+    "lib0": "^0.2.117",
+    "ws": "^8.19.0",
+    "y-protocols": "^1.0.7",
+    "yjs": "^13.6.29"
+  }
+}
