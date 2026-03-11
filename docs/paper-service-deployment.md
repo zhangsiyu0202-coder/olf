@@ -1,536 +1,153 @@
-# 论文搜索服务部署指南
+# 论文服务部署指南（香港独立节点）
 
-本指南面向“第一次部署也能照着做”的场景，目标是把论文搜索能力独立部署到香港服务器，再让主站通过 HTTP 调用它。
+本指南是当前生产推荐版本：论文服务独立部署到香港服务器，并通过公网 HTTPS 提供服务，主站通过 `PAPER_ASSISTANT_BASE_URL` 调用。
 
-## 1. 这套结构是什么
+## 1. 目标架构
 
-当前论文模块已经拆成两层：
+- 主站（内地或主业务节点）
+  - 负责项目、编辑、编译、协作、用户会话
+  - 通过 HTTP 调用论文服务
+- 香港论文服务节点
+  - `paper-service` 容器处理搜索/详情/BibTeX/PDF 代理/论文 Agent
+  - `paper-gateway`（Caddy）对外提供 `443`
 
-- 主站
-  - 继续负责项目、文件、编辑、编译、协作、引用写入
-  - 通过 `PAPER_ASSISTANT_BASE_URL` 调用论文搜索服务
+约束：
 
-- 论文搜索服务
-  - 适合部署在香港服务器
-  - 负责多源论文搜索、详情、BibTeX、PDF 代理和研究 Agent
+- 采用公网 HTTPS + IP 白名单。
+- 不新增应用层 token/mTLS。
+- 香港服务不可用时，主站论文功能直接报错，不回退本地 CLI。
 
-一句话理解：
+## 2. 前置准备
 
-- 主站负责“写论文”
-- 香港服务负责“搜论文、读论文”
+### 2.1 香港服务器
 
-## 2. 当前支持什么
+- Ubuntu 22.04+
+- Docker + Docker Compose
+- 固定公网 IP
+- 允许 80/443 入站（之后 443 做白名单）
 
-当前论文搜索服务已经支持：
+### 2.2 域名与证书
 
-- 多源搜索
-  - `arXiv`
-  - `PubMed`
-- 发现源搜索
-  - `OpenAlex`
-- 单篇论文详情
-- BibTeX 生成
-- PDF 代理与缓存
-- 研究场景 Agent
-- 结构化论文报告生成（DSPy 约束链路）
+- 准备域名：`papers.your-domain.com`
+- A 记录指向香港服务器公网 IP
+- Caddy 自动申请证书，需要：
+  - `PAPER_PUBLIC_DOMAIN`
+  - `ACME_EMAIL`
 
-说明：
+## 3. 香港节点部署步骤
 
-- `OpenAlex` 只承担发现源职责；阅读时会自动尝试解析到 `arXiv / PubMed`。
-- 解析只接受 DOI、arXiv ID、PMID、PMCID 这类显式标识符，不做标题弱匹配。
-- 如果 discovery 结果无法解析到可读源，阅读接口会直接返回 `未找到可读来源`。
-
-## 3. 部署前你需要准备什么
-
-### 3.1 香港服务器
-
-建议最低配置：
-
-- Ubuntu 22.04 或兼容 Linux
-- 2 核 CPU
-- 4 GB 内存
-- 20 GB 磁盘
-
-### 3.2 本地与服务器都要有的东西
-
-- Node.js 20+
-- Python 3.10+
-- 仓库代码
-- 可联网安装依赖
-
-### 3.3 可选但推荐
-
-- 一个域名，例如 `papers.your-domain.com`
-- Nginx
-- HTTPS 证书
-
-## 4. 最简单的本地验证
-
-先在当前仓库本地验证论文搜索服务能跑，再上香港服务器。
-
-### 第一步：安装前端/Node 依赖
+### 3.1 拉代码并准备环境
 
 ```bash
-npm install
-```
-
-### 第二步：确认 Python 虚拟环境可用
-
-如果你的虚拟环境还没准备好，最简单做法：
-
-```bash
-python3 -m venv .venv
-.venv/bin/pip install --upgrade pip
-.venv/bin/pip install fastapi uvicorn httpx "langchain==1.2.10" "langchain-community==0.4.1" "langchain-openai==1.1.10" arxiv biopython pyalex pymupdf xmltodict "dspy>=2.6,<3"
-```
-
-如果仓库当前 `.venv` 已经可用，可以跳过这一步。
-
-### 第三步：启动论文搜索服务
-
-```bash
-npm run dev:paper-service
-```
-
-默认监听：
-
-```text
-http://127.0.0.1:8090
-```
-
-### 第四步：健康检查
-
-```bash
-curl http://127.0.0.1:8090/health
-```
-
-预期返回：
-
-```json
-{"status":"ok","service":"paper-search"}
-```
-
-### 第五步：搜索测试
-
-```bash
-curl -X POST http://127.0.0.1:8090/v1/search \
-  -H 'content-type: application/json' \
-  --data '{"query":"multimodal reasoning","limit":4,"sources":["arxiv","pubmed","openalex"]}'
-```
-
-如果返回包含 `results` 数组、统一的 `source/sourceLabel/sourceId` 字段，以及 `sourceStatuses`，说明多源搜索和来源状态汇总都已打通。
-
-### 第六步：启动论文报告 worker（主站侧）
-
-论文报告是异步任务，不由 `paper-service` 自己消费。你需要在主站机器额外启动：
-
-```bash
-npm run dev:worker:paper-report
-```
-
-如果不启动这个 worker，报告接口会停留在 `queued/running`，不会自动变成 `ready/degraded`。
-
-## 5. 在香港服务器上部署论文搜索服务
-
-下面这套是最直接、最容易照着做的部署步骤。
-
-### 5.0 一次性复制执行版
-
-如果你想从一台空白香港服务器开始，直接复制下面这整段命令即可。
-
-需要你自己替换的只有两处：
-
-- `你的仓库地址`
-- `你的模型Key`（如果暂时不用研究 Agent，可以先留空）
-
-```bash
-ssh root@你的香港服务器IP
-
-apt-get update
-apt-get install -y git curl python3 python3-venv python3-pip
-
-if ! command -v node >/dev/null 2>&1; then
-  curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
-  apt-get install -y nodejs
-fi
-
-mkdir -p /srv
-cd /srv
-
-if [ ! -d /srv/overleaf ]; then
-  git clone 你的仓库地址 /srv/overleaf
-fi
-
+git clone <your-repo> /srv/overleaf
 cd /srv/overleaf
-
-npm install
-
-python3 -m venv .venv
-.venv/bin/pip install --upgrade pip
-.venv/bin/pip install fastapi uvicorn httpx "langchain==1.2.10" "langchain-community==0.4.1" "langchain-openai==1.1.10" arxiv biopython pyalex pymupdf xmltodict "dspy>=2.6,<3"
-
-cat >/etc/systemd/system/overleaf-paper.service <<'SERVICE'
-[Unit]
-Description=Overleaf Clone Paper Search Service
-After=network.target
-
-[Service]
-Type=simple
-WorkingDirectory=/srv/overleaf
-Environment=AI_API_KEY=你的模型Key
-Environment=AI_BASE_URL=https://api.deepseek.com/v1
-Environment=AI_MODEL_NAME=deepseek-chat
-ExecStart=/srv/overleaf/.venv/bin/uvicorn main:app --app-dir apps/paper-service --host 0.0.0.0 --port 8090
-Restart=always
-RestartSec=3
-User=root
-
-[Install]
-WantedBy=multi-user.target
-SERVICE
-
-systemctl daemon-reload
-systemctl enable overleaf-paper
-systemctl restart overleaf-paper
-systemctl status overleaf-paper --no-pager
-
-curl http://127.0.0.1:8090/health
+cp .env.paper-hk.example .env.paper-hk
 ```
 
-如果最后一条 `curl` 返回：
-
-```json
-{"status":"ok","service":"paper-search"}
-```
-
-说明香港服务器上的论文服务已经可用了。
-
-然后你在主站机器上这样启动 API：
+编辑 `.env.paper-hk`，至少填写：
 
 ```bash
-PAPER_ASSISTANT_BASE_URL=http://你的香港服务器IP:8090 npm run dev:api
+AI_API_KEY=...
+AI_BASE_URL=...
+AI_MODEL_NAME=...
+PAPER_PUBLIC_DOMAIN=papers.your-domain.com
+ACME_EMAIL=ops@your-domain.com
+PAPER_HK_IMAGE_TAG=latest
 ```
 
-如果你已经给香港服务挂了域名和 HTTPS，就改成：
-
-```bash
-PAPER_ASSISTANT_BASE_URL=https://papers.your-domain.com npm run dev:api
-```
-
-### 第一步：登录香港服务器
-
-```bash
-ssh root@你的香港服务器IP
-```
-
-### 第二步：安装系统依赖
-
-```bash
-apt-get update
-apt-get install -y git curl python3 python3-venv python3-pip nodejs npm
-```
-
-如果你的服务器 Node 版本太旧，建议改用 NodeSource 或 nvm 安装 Node 20+。
-
-### 第三步：拉代码
-
-```bash
-git clone 你的仓库地址 /srv/overleaf
-cd /srv/overleaf
-```
-
-### 第四步：安装 Node 依赖
+### 3.2 执行部署
 
 ```bash
 npm install
+npm run deploy:paper-hk
 ```
 
-### 第五步：创建 Python 虚拟环境并安装论文服务依赖
+脚本会自动做：
 
-```bash
-python3 -m venv .venv
-.venv/bin/pip install --upgrade pip
-.venv/bin/pip install fastapi uvicorn httpx "langchain==1.2.10" "langchain-community==0.4.1" "langchain-openai==1.1.10" arxiv biopython pyalex pymupdf xmltodict
-```
+1. `git pull --ff-only`
+2. `docker compose -f infra/docker-compose.paper-hk.yml build`
+3. `docker compose ... up -d`
+4. `https://papers.your-domain.com/health` 探测
+5. `/v1/search` smoke check
 
-### 第六步：启动论文搜索服务
+## 4. 主站侧接入
 
-最简单的启动方式：
-
-```bash
-.venv/bin/uvicorn main:app \
-  --app-dir apps/paper-service \
-  --host 0.0.0.0 \
-  --port 8090
-```
-
-如果你还要让研究 Agent 正常工作，需要额外配置模型环境变量，例如：
-
-```bash
-export AI_API_KEY=你的模型Key
-export AI_BASE_URL=https://api.deepseek.com/v1
-export AI_MODEL_NAME=deepseek-chat
-```
-
-如果你要调整搜索重排行为，可额外配置：
-
-```bash
-export PAPER_RERANK_MODE=heuristic   # heuristic 或 none，默认 heuristic
-export PAPER_RERANK_TOP_K=200        # 仅重排前 K 条，范围 1..500，默认 200
-```
-
-然后再启动：
-
-```bash
-.venv/bin/uvicorn main:app \
-  --app-dir apps/paper-service \
-  --host 0.0.0.0 \
-  --port 8090
-```
-
-## 6. 推荐的长期运行方式：systemd
-
-如果你不想手动一直挂着进程，推荐用 `systemd`。
-
-### 创建服务文件
-
-```bash
-cat >/etc/systemd/system/overleaf-paper.service <<'SERVICE'
-[Unit]
-Description=Overleaf Clone Paper Search Service
-After=network.target
-
-[Service]
-Type=simple
-WorkingDirectory=/srv/overleaf
-Environment=AI_API_KEY=你的模型Key
-Environment=AI_BASE_URL=https://api.deepseek.com/v1
-Environment=AI_MODEL_NAME=deepseek-chat
-ExecStart=/srv/overleaf/.venv/bin/uvicorn main:app --app-dir apps/paper-service --host 0.0.0.0 --port 8090
-Restart=always
-RestartSec=3
-User=root
-
-[Install]
-WantedBy=multi-user.target
-SERVICE
-```
-
-### 启动并设为开机自启
-
-```bash
-systemctl daemon-reload
-systemctl enable overleaf-paper
-systemctl start overleaf-paper
-systemctl status overleaf-paper
-```
-
-## 7. 推荐的对外暴露方式：Nginx 反向代理
-
-如果你有域名，推荐把论文服务挂成：
-
-```text
-https://papers.your-domain.com
-```
-
-### Nginx 示例配置
-
-```nginx
-server {
-    listen 80;
-    server_name papers.your-domain.com;
-
-    location / {
-        proxy_pass http://127.0.0.1:8090;
-        proxy_http_version 1.1;
-        proxy_set_header Host $host;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto $scheme;
-    }
-}
-```
-
-改完后：
-
-```bash
-nginx -t
-systemctl reload nginx
-```
-
-## 8. 主站如何接入香港论文搜索服务
-
-主站这边不需要再本地跑 Python 论文搜索逻辑，只要配置：
-
-```bash
-PAPER_ASSISTANT_BASE_URL=http://你的香港服务器IP:8090
-```
-
-如果你挂了域名和 HTTPS：
+主站 `.env.main` 必须配置：
 
 ```bash
 PAPER_ASSISTANT_BASE_URL=https://papers.your-domain.com
+PAPER_ASSISTANT_TIMEOUT_MS=25000
 ```
 
-### 本地启动主站示例
+然后在主站机器执行：
 
 ```bash
-RUNTIME_POSTGRES_URL=postgresql://overleaf:overleaf@127.0.0.1:5433/overleaf \
-PAPER_ASSISTANT_BASE_URL=https://papers.your-domain.com \
-npm run dev:api
+npm run deploy:main
 ```
 
-这时主站会：
+## 5. IP 白名单策略
 
-- 搜索论文时调香港论文服务
-- 打开论文详情时调香港论文服务
-- 导入 BibTeX 时调香港论文服务
-- 打开 PDF 时先调香港论文服务，再由主站本地缓存
-- 论文阅读页打开时异步触发报告生成，并由 `paper-report worker` 消费任务
+在云防火墙/安全组中配置：
 
-## 9. 论文服务接口一览
+1. 仅允许主站出口 IP 访问香港节点 `443`。
+2. `8090` 不允许公网访问。
+3. 若需要证书自动续期，`80` 仅用于 ACME challenge（可按网关策略限制）。
 
-### 9.1 健康检查
+## 6. 健康检查与烟测
 
-```http
-GET /health
-```
-
-### 9.2 多源搜索
-
-```http
-POST /v1/search
-Content-Type: application/json
-```
-
-请求体：
-
-```json
-{
-  "query": "multimodal reasoning",
-  "limit": 200,
-  "sources": ["arxiv", "pubmed", "openalex"]
-}
-```
-
-说明：
-
-- `limit` 不传时默认是 `200`
-- `limit` 最大允许 `500`
-
-### 9.3 单篇详情
-
-```http
-GET /v1/papers/{paperId}?max_chars=18000
-```
-
-示例：
+### 6.1 香港服务
 
 ```bash
-curl "http://127.0.0.1:8090/v1/papers/arxiv%3A2505.04921v2?max_chars=3000"
+curl -k --resolve papers.your-domain.com:443:127.0.0.1 \
+  https://papers.your-domain.com/health
 ```
-
-### 9.4 BibTeX
-
-```http
-GET /v1/papers/{paperId}/bibtex
-```
-
-### 9.5 PDF 代理
-
-```http
-GET /v1/papers/{paperId}/pdf
-```
-
-### 9.6 研究 Agent
-
-```http
-POST /v1/agent
-Content-Type: application/json
-```
-
-请求体：
-
-```json
-{
-  "message": "帮我比较 multimodal reasoning 的代表论文",
-  "selectedPaperIds": ["arxiv:2505.04921v2"],
-  "sources": ["arxiv", "pubmed"]
-}
-```
-
-### 9.7 结构化报告生成
-
-```http
-POST /v1/reports/generate
-Content-Type: application/json
-```
-
-请求体示例：
-
-```json
-{
-  "paperId": "arxiv:2505.04921v2",
-  "maxChars": 24000,
-  "language": "zh-CN"
-}
-```
-
-说明：
-
-- 该接口是“单次执行接口”，不负责队列与缓存状态管理。
-- 主站负责 `ensure/get/regenerate` 编排与任务状态机。
-
-## 10. 现在前端会看到什么变化
-
-接上香港论文服务后，论文搜索结果会：
-
-- 带明确来源标签
-- 聚合多个来源
-- 区分 discovery 源与可读源
-- 导入项目文献库时保留来源信息
-
-## 11. 常见问题
-
-### 11.1 为什么我搜得到，但打不开 PDF？
-
-因为“搜索发现源”和“全文获取源”不是同一层。
-
-常见情况：
-
-- `OpenAlex` 只是发现源，未必能解析到 `arXiv / PubMed`
-- `PubMed` 有时只有摘要，没有 PMC PDF
-- 只有解析到了 `arXiv` 或带 PMC PDF 的 `PubMed` 记录时，才更容易直接读
-
-### 11.2 为什么主站不直接访问这些海外论文站点？
-
-因为主站面向中国大陆用户，跨境访问稳定性差。把论文服务单独部署到香港节点，更符合实际网络条件。
-
-### 11.3 如果香港服务挂了怎么办？
-
-主站目前仍保留本地 CLI 回退模式。只要不配置 `PAPER_ASSISTANT_BASE_URL`，主站就会改走本地 Python 论文工具。
-
-## 12. 最短上手版
-
-如果你只想最快跑起来，看这 4 步就够：
-
-1. 在香港服务器拉代码并安装依赖
-2. 启动论文服务：
 
 ```bash
-cd /srv/overleaf
-.venv/bin/uvicorn main:app --app-dir apps/paper-service --host 0.0.0.0 --port 8090
+curl -k --resolve papers.your-domain.com:443:127.0.0.1 \
+  -X POST https://papers.your-domain.com/v1/search \
+  -H 'Content-Type: application/json' \
+  -d '{"query":"deep learning","limit":3,"sources":["arxiv"]}'
 ```
 
-3. 本地或主站配置：
+### 6.2 主站到香港连通
+
+在主站机器执行：
 
 ```bash
-PAPER_ASSISTANT_BASE_URL=http://香港服务器IP:8090
+curl -fsS "$PAPER_ASSISTANT_BASE_URL/health"
 ```
 
-4. 启动主站 API
+## 7. 回滚
+
+香港节点回滚：
 
 ```bash
-npm run dev:api
+bash scripts/deploy-paper-hk.sh rollback <old_tag>
 ```
 
-到这里，主站的论文搜索就会自动走香港服务器。
+主站回滚：
+
+```bash
+bash scripts/deploy-main.sh rollback <old_tag>
+```
+
+两者都遵循固定动作：
+
+```bash
+docker compose ... down
+docker compose ... up -d
+```
+
+## 8. 常见问题
+
+### 8.1 为什么主站不再内置 paper-service 容器？
+
+为了把跨境检索链路稳定收敛到香港节点，避免主站机和论文机混部导致的网络波动与策略不一致。
+
+### 8.2 为什么不用应用层 token？
+
+当前安全决策是“公网 HTTPS + IP 白名单”，先减少系统复杂度。后续若要提升安全等级，可升级 mTLS。
+
+### 8.3 香港服务挂了会怎样？
+
+主站论文接口会直接返回错误（按当前产品决策），不会静默降级或回退本地 CLI。

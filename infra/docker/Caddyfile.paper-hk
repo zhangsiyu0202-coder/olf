@@ -1,0 +1,12 @@
+{
+  email {$ACME_EMAIL}
+}
+
+{$PAPER_PUBLIC_DOMAIN} {
+  encode gzip zstd
+  reverse_proxy paper-service:8090
+
+  header {
+    -Server
+  }
+}

@@ -24,9 +24,18 @@
     "build:web": "npm run build --workspace @overleaf-clone/web",
     "test:smoke": "node scripts/smoke-test.js",
     "test:smoke:local-ai": "AI_API_KEY= AI_BASE_URL= node scripts/smoke-test.js",
+    "deploy:main": "bash scripts/deploy-main.sh deploy",
+    "deploy:paper-hk": "bash scripts/deploy-paper-hk.sh deploy",
+    "monitor:paper": "bash scripts/monitor-paper-service.sh",
     "docker:up": "docker compose -f infra/docker-compose.app.yml up -d --build",
     "docker:down": "docker compose -f infra/docker-compose.app.yml down",
     "docker:logs": "docker compose -f infra/docker-compose.app.yml logs -f",
+    "docker:main:up": "docker compose --env-file .env.main -f infra/docker-compose.main.yml up -d --build",
+    "docker:main:down": "docker compose --env-file .env.main -f infra/docker-compose.main.yml down",
+    "docker:main:logs": "docker compose --env-file .env.main -f infra/docker-compose.main.yml logs -f",
+    "docker:paper-hk:up": "docker compose --env-file .env.paper-hk -f infra/docker-compose.paper-hk.yml up -d --build",
+    "docker:paper-hk:down": "docker compose --env-file .env.paper-hk -f infra/docker-compose.paper-hk.yml down",
+    "docker:paper-hk:logs": "docker compose --env-file .env.paper-hk -f infra/docker-compose.paper-hk.yml logs -f",
     "platform:up": "docker compose --env-file infra/platform.env.example -f infra/docker-compose.platform.yml up -d",
     "platform:down": "docker compose --env-file infra/platform.env.example -f infra/docker-compose.platform.yml down"
   }

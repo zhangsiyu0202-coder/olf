@@ -50,6 +50,7 @@ docs/
 - [论文多源检索设计](./docs/paper-search-architecture.md)
 - [论文搜索服务部署指南](./docs/paper-service-deployment.md)
 - [Docker 部署指南](./docs/docker-deployment.md)
+- [主站 + 香港论文服务完整部署教程](./docs/main-hk-deployment-tutorial.md)
 - [Agent 协作规范](./AGENTS.md)
 - [MVP 规格](./.kiro/specs/overleaf-mvp/requirements.md)
 
@@ -93,7 +94,7 @@ docs/
 - `latexmk` 多轮编译与内容哈希编译缓存
 - 论文检索、项目文献库、`refs.bib` 导入与 PDF 阅读
 - 论文模块的产品目标已定义为“多源聚合检索 + 分层全文获取”；当前已接入 `arXiv / PubMed / OpenAlex`
-- 主站已支持通过 `PAPER_ASSISTANT_BASE_URL` 对接独立论文搜索服务，适合部署到香港节点
+- 主站已支持通过 `PAPER_ASSISTANT_BASE_URL` 对接独立论文搜索服务，推荐部署到香港节点并走公网 HTTPS
 - 轻回流：从论文阅读区插入引用、插入总结、保存阅读笔记
 - 论文 PDF 摘录：高亮选区、保存备注、项目内回看
 - 独立探索页：平台精选模板、功能示例、模板详情预览与“以模板创建项目”
@@ -162,7 +163,7 @@ docs/
 - 元数据后端可通过 `RUNTIME_METADATA_BACKEND=file|postgres` 切换。
 - 切换到 PostgreSQL 后可运行 `node scripts/migrate-storage.js` 导入现有元数据。
 - 若启用正式登录、组织团队、审计日志与版本事件，必须配置 `RUNTIME_POSTGRES_URL`。
-- 若主站需要通过香港节点使用独立论文搜索服务，可配置 `PAPER_ASSISTANT_BASE_URL` 指向该服务，例如 `http://127.0.0.1:8090`。
+- 若主站需要通过香港节点使用独立论文搜索服务，可配置 `PAPER_ASSISTANT_BASE_URL` 指向该服务，例如 `https://papers.your-domain.com`。
 - 当前开发机已安装本地 PostgreSQL 14；由于 `5432` 被本机 Docker 占用，系统 PostgreSQL 集群实际监听在 `5433`。
 - 当前可直接使用的本地连接串是 `postgresql://overleaf:overleaf@127.0.0.1:5433/overleaf`。
 - 首次启用正式认证前，需确保目标数据库已创建 `pgcrypto` 扩展；当前本地 `overleaf` 数据库已完成该初始化。
@@ -177,12 +178,15 @@ docs/
 
 ## Docker 运行
 
-如果你希望用容器把主站、论文服务、数据库、对象存储和编译 Worker 一起跑起来：
+如果你希望按生产推荐形态运行：
 
-1. 准备环境变量：`cp .env.example .env`
-2. 按需填写 `AI_API_KEY`
-3. 启动整站：`npm run docker:up`
-4. 打开 `http://127.0.0.1:3000`
+1. 主站机器：`cp .env.main.example .env.main`
+2. 香港论文服务机器：`cp .env.paper-hk.example .env.paper-hk`
+3. 在香港机器执行：`npm run deploy:paper-hk`
+4. 在主站机器执行：`npm run deploy:main`
+5. 打开 `http://127.0.0.1:3000`
+
+如果你仅做单机联调，仍可使用旧命令：`npm run docker:up`。
 
 更完整的说明见 [Docker 部署指南](./docs/docker-deployment.md)。
 

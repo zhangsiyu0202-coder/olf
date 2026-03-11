@@ -1,0 +1,43 @@
+services:
+  paper-service:
+    image: overleaf/paper-service:${PAPER_HK_IMAGE_TAG:-latest}
+    build:
+      context: ..
+      dockerfile: infra/docker/Dockerfile.paper-service
+    container_name: overleaf-paper-hk
+    restart: unless-stopped
+    environment:
+      AI_API_KEY: ${AI_API_KEY:-}
+      AI_BASE_URL: ${AI_BASE_URL:-https://api.deepseek.com/v1}
+      AI_MODEL_NAME: ${AI_MODEL_NAME:-deepseek-chat}
+      PAPER_SOURCE_TIMEOUT_MS: ${PAPER_SOURCE_TIMEOUT_MS:-15000}
+      PAPER_SERVICE_CACHE_ROOT: /app/.runtime/paper-service-cache
+    volumes:
+      - runtime_data:/app/.runtime
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8090/health', timeout=5).read()"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+
+  paper-gateway:
+    image: caddy:2.8.4-alpine
+    container_name: overleaf-paper-hk-gateway
+    restart: unless-stopped
+    depends_on:
+      paper-service:
+        condition: service_healthy
+    environment:
+      PAPER_PUBLIC_DOMAIN: ${PAPER_PUBLIC_DOMAIN:?PAPER_PUBLIC_DOMAIN is required}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./docker/Caddyfile.paper-hk:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+
+volumes:
+  runtime_data:
+  caddy_data:
+  caddy_config:

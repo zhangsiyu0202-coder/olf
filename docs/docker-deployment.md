@@ -1,140 +1,155 @@
-# Docker 部署指南
+# Docker 部署指南（主站 + 香港论文服务拆分）
 
-本文档用于说明如何把主站、论文搜索服务、PostgreSQL、MinIO 和编译 Worker 一起用 Docker 跑起来。
+本文档给出当前推荐的生产部署形态：
 
-## 1. 适用场景
+- 主站机器：`api + worker + paper-report-worker + postgres + minio`（全容器化）
+- 香港机器：`paper-service + HTTPS 网关`（独立容器化）
 
-- 你想在单机上快速把整站拉起来
-- 你希望 API、Worker、论文服务和存储都走容器
-- 你不想手工开四五个终端
+主站通过 `PAPER_ASSISTANT_BASE_URL` 调用香港论文服务。论文服务不可用时，主站按当前策略直接报错，不回退本地 CLI。
 
-当前 Docker 方案包含这些服务：
+## 1. 部署文件
 
-- `api`：主站 API，同时托管前端构建产物
-- `worker`：LaTeX 编译 Worker，容器内已预装常用 TeX 环境
-- `paper-service`：多源论文搜索服务
-- `postgres`：元数据数据库
-- `minio`：对象存储
+新增两套编排文件：
 
-## 2. 启动前准备
+- 主站编排：`infra/docker-compose.main.yml`
+- 香港论文服务编排：`infra/docker-compose.paper-hk.yml`
 
-建议先在仓库根目录准备环境变量：
+仍保留历史单机编排 `infra/docker-compose.app.yml`，仅用于本地或一体化调试。
 
-```bash
-cp .env.example .env
-```
+## 2. 环境文件准备
 
-至少把下面几项改掉：
+仓库根目录先复制两份示例：
 
 ```bash
-AI_API_KEY=你的模型Key
-AI_BASE_URL=https://api.deepseek.com/v1
-AI_MODEL_NAME=deepseek-chat
-ALLOW_DEMO_AUTH=0
+cp .env.main.example .env.main
+cp .env.paper-hk.example .env.paper-hk
 ```
 
-如果你只想先验证整站能跑，不关心正式登录，也可以临时打开演示登录：
+你至少需要填写：
+
+- `.env.main`
+  - `PAPER_ASSISTANT_BASE_URL=https://papers.your-domain.com`
+  - `PLATFORM_POSTGRES_PASSWORD`
+  - `AI_API_KEY`（如果需要远端 AI 能力）
+- `.env.paper-hk`
+  - `PAPER_PUBLIC_DOMAIN=papers.your-domain.com`
+  - `ACME_EMAIL`
+  - `AI_API_KEY`
+
+## 3. 主站机器部署
+
+### 3.1 一键部署
 
 ```bash
-ALLOW_DEMO_AUTH=1
+npm run deploy:main
 ```
 
-## 3. 一键启动
+等价于：
 
-在仓库根目录执行：
+1. `git pull --ff-only`
+2. `docker compose --env-file .env.main -f infra/docker-compose.main.yml build`
+3. `docker compose ... up -d`
+4. 健康检查：`/api/health`
+5. 远端论文服务 smoke check：`$PAPER_ASSISTANT_BASE_URL/health` + `/v1/search`
+6. 启动定时探测脚本：`scripts/monitor-paper-service.sh start`
+
+### 3.2 回滚
 
 ```bash
-npm run docker:up
+bash scripts/deploy-main.sh rollback <上一版本镜像tag>
 ```
 
-首次启动会做三件事：
-
-1. 构建 `api` 镜像
-2. 构建 `worker` 镜像
-3. 构建 `paper-service` 镜像
-
-然后会自动启动：
-
-- `http://127.0.0.1:3000` 主站
-- `http://127.0.0.1:8090/health` 论文服务健康检查
-- `http://127.0.0.1:9011` MinIO 控制台
-
-## 4. 查看日志
+脚本会执行：
 
 ```bash
-npm run docker:logs
+docker compose ... down
+docker compose ... up -d
 ```
 
-只看某个服务：
+并再次执行健康检查和 smoke check。
+
+## 4. 香港论文服务部署
+
+### 4.1 一键部署
 
 ```bash
-docker compose -f infra/docker-compose.app.yml logs -f api
-docker compose -f infra/docker-compose.app.yml logs -f worker
-docker compose -f infra/docker-compose.app.yml logs -f paper-service
+npm run deploy:paper-hk
 ```
 
-## 5. 停止服务
+等价于：
+
+1. `git pull --ff-only`
+2. `docker compose --env-file .env.paper-hk -f infra/docker-compose.paper-hk.yml build`
+3. `docker compose ... up -d`
+4. 本机 HTTPS 探测：`https://$PAPER_PUBLIC_DOMAIN/health`（通过 `--resolve`）
+5. 搜索 smoke check：`/v1/search`
+
+### 4.2 回滚
 
 ```bash
-npm run docker:down
+bash scripts/deploy-paper-hk.sh rollback <上一版本镜像tag>
 ```
 
-如果你还想连卷一起删掉：
+## 5. 网络与安全（公网 HTTPS + IP 白名单）
+
+### 5.1 香港侧入口
+
+- 对外仅暴露 `443`（可保留 `80` 用于证书挑战）。
+- `paper-service` 的 `8090` 不对公网开放。
+- 反向代理配置文件：`infra/docker/Caddyfile.paper-hk`
+
+### 5.2 白名单策略
+
+IP 白名单在云防火墙/安全组配置：
+
+1. 允许 `主站出口 IP -> 香港服务器:443`
+2. 拒绝其他来源访问 `443`
+3. 禁止公网访问 `8090`
+
+## 6. 运维检查
+
+### 6.1 主站论文连通监控
 
 ```bash
-docker compose -f infra/docker-compose.app.yml down -v
+bash scripts/monitor-paper-service.sh status
+tail -f .runtime/paper-service-monitor.log
 ```
 
-## 6. 服务说明
-
-### 6.1 主站 API
-
-- 对外端口：`3000`
-- 同时托管前端页面和 `/api/*`
-- 会自动通过容器内地址 `http://paper-service:8090` 调论文服务
-
-### 6.2 编译 Worker
-
-- 不直接暴露端口
-- 容器内已预装 `latexmk / pdflatex / xelatex / lualatex`
-- 当前默认走 `host` 编译模式，但这里的 `host` 指 Worker 容器自身环境，不依赖宿主机额外安装 TeX
-
-### 6.3 论文服务
-
-- 对外端口：`8090`
-- 供主站调用，也可直接访问 `/health`
-- 支持 `arXiv / PubMed / OpenAlex`
-
-### 6.4 存储
-
-- PostgreSQL：`5432`
-- MinIO S3 API：`9010`
-- MinIO Console：`9011`
-
-## 7. 本地开发模式的一键启动
-
-如果你暂时不想进 Docker，而是继续本机联调，可以用：
+手工单次探测：
 
 ```bash
-npm run dev:stack
+PAPER_ASSISTANT_BASE_URL=https://papers.your-domain.com \
+  bash scripts/monitor-paper-service.sh once
 ```
 
-它会自动：
+### 6.2 常用日志
 
-- 统一 `API_PORT / WEB_PORT / PAPER_SERVICE_PORT`
-- 自动把前端代理指向当前 API 端口
-- 若未配置 `PAPER_ASSISTANT_BASE_URL`，默认顺手拉起本地论文服务
+```bash
+npm run docker:main:logs
+npm run docker:paper-hk:logs
+```
 
-## 8. 常见问题
+只看单服务：
 
-### 8.1 前端为什么不单独开一个容器？
+```bash
+docker compose --env-file .env.main -f infra/docker-compose.main.yml logs -f api
+docker compose --env-file .env.main -f infra/docker-compose.main.yml logs -f worker
+docker compose --env-file .env.paper-hk -f infra/docker-compose.paper-hk.yml logs -f paper-service
+docker compose --env-file .env.paper-hk -f infra/docker-compose.paper-hk.yml logs -f paper-gateway
+```
 
-当前主站 API 已经支持直接托管 `apps/web/dist`，所以 Docker 方案里让 API 统一对外即可。这样结构更简单，也更接近生产入口。
+## 7. 本地验证命令
 
-### 8.2 Worker 为什么也要单独一个容器？
+主站：
 
-编译任务是持续后台任务，不适合跟 API 放在一个进程里。拆成独立容器后，后续横向扩更多 Worker 也更自然。
+```bash
+npm run docker:main:up
+curl http://127.0.0.1:3000/api/health
+```
 
-### 8.3 Docker 里为什么还要 MinIO？
+香港服务（在香港机器）：
 
-因为当前项目已经支持 `file / s3` 两套 blob 后端。Docker 方案默认把对象存储也带上，这样更接近成品化形态，避免本地容器里先跑文件后端、线上又换一套。
+```bash
+npm run docker:paper-hk:up
+curl -k --resolve papers.your-domain.com:443:127.0.0.1 https://papers.your-domain.com/health
+```
