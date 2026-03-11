@@ -24,7 +24,7 @@
  *   - node:url
  *
  * Last Updated:
- *   - 2026-03-08 by Codex - 新增模板镜像缓存路径
+ *   - 2026-03-11 by Codex - 新增论文报告与论文笔记运行时路径
  */
 
 import path from "node:path";
@@ -46,6 +46,10 @@ export const runtimeSnapshotArchivesRoot = path.join(runtimeSnapshotsRoot, "arch
 export const runtimeSnapshotMetadataRoot = path.join(runtimeSnapshotsRoot, "metadata");
 export const runtimePapersRoot = path.join(runtimeRoot, "papers");
 export const runtimePaperPdfCacheRoot = path.join(runtimePapersRoot, "pdf-cache");
+export const runtimePaperReportsRoot = path.join(runtimeDataRoot, "paper-reports");
+export const runtimePaperReportJobsRoot = path.join(runtimeDataRoot, "paper-report-jobs");
+export const runtimePaperReportJobLocksRoot = path.join(runtimeDataRoot, "paper-report-job-locks");
+export const runtimePaperNotesRoot = path.join(runtimeDataRoot, "paper-notes");
 export const runtimeTemplateCacheRoot = path.join(runtimeRoot, "template-cache");
 export const webStaticRoot = path.join(repositoryRoot, "apps", "web", "dist");
 
@@ -93,6 +97,22 @@ export function getPaperPdfCachePath(paperId) {
   return path.join(runtimePaperPdfCacheRoot, `${encodeURIComponent(paperId)}.pdf`);
 }
 
+export function getPaperReportRecordPath(canonicalPaperId) {
+  return path.join(runtimePaperReportsRoot, `${encodeURIComponent(canonicalPaperId)}.json`);
+}
+
+export function getPaperReportJobFilePath(jobId) {
+  return path.join(runtimePaperReportJobsRoot, `${jobId}.json`);
+}
+
+export function getPaperReportJobLockPath(canonicalPaperId) {
+  return path.join(runtimePaperReportJobLocksRoot, `${encodeURIComponent(canonicalPaperId)}.json`);
+}
+
+export function getPaperNotesManifestPath(projectId) {
+  return path.join(runtimePaperNotesRoot, `${projectId}.json`);
+}
+
 export function getTemplateCachePath(templateId) {
   return path.join(runtimeTemplateCacheRoot, `${encodeURIComponent(templateId)}.json`);
 }
@@ -103,5 +123,6 @@ export function getTemplateCachePath(templateId) {
  * - 当前实现默认仓库本地运行，若切换部署模式，应优先扩展本文件而不是散落修改调用方。
  * - 该文件不执行文件系统写入，保持为纯路径推导工具。
  * - 论文 PDF 缓存路径也在此统一定义，避免 API 与论文服务对缓存布局各自维护一套规则。
+ * - 论文报告缓存、报告任务与论文笔记路径已统一放在这里，后续切存储后端时不需要改业务层拼路径逻辑。
  * - 模板镜像缓存路径同样收敛在这里，后续若切换对象存储或远端缓存，可只改这一层。
  */

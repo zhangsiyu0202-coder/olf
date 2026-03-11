@@ -30,7 +30,7 @@
  *   - packages/shared
  *
  * Last Updated:
- *   - 2026-03-08 by Codex - 新增探索页模板目录、模板建项目与全局聚合搜索 API
+ *   - 2026-03-11 by Codex - 新增论文报告任务接口与论文私有笔记接口
  */
 
 import fs from "node:fs/promises";
@@ -58,6 +58,7 @@ import {
   ensurePaperPdfCached,
   generatePaperBibtex,
   loadPaperDetails,
+  loadPaperMetadata,
   searchPapers,
 } from "../../../packages/paper-assistant/src/service.js";
 import {
@@ -162,6 +163,23 @@ import {
   updateProjectPaperHighlight,
 } from "../../../packages/runtime-store/src/paper-highlights.js";
 import {
+  createProjectPaperNote,
+  deleteProjectPaperNote,
+  ensurePaperNoteStorage,
+  listProjectPaperNotes,
+  updateProjectPaperNote,
+} from "../../../packages/runtime-store/src/paper-notes.js";
+import {
+  ensurePaperReportStorage,
+  getPaperReport,
+} from "../../../packages/runtime-store/src/paper-reports.js";
+import {
+  createOrReusePaperReportJob,
+  ensurePaperReportJobStorage,
+  getActivePaperReportJob,
+  getLatestPaperReportJob,
+} from "../../../packages/runtime-store/src/paper-report-jobs.js";
+import {
   getTemplate,
   listTemplates,
   searchTemplates,
@@ -173,6 +191,7 @@ import {
 } from "../../../packages/runtime-store/src/users.js";
 import { fileExists } from "../../../packages/shared/src/fs.js";
 import { getProjectRoot, webStaticRoot } from "../../../packages/shared/src/paths.js";
+import { splitPaperReference } from "../../../packages/shared/src/paper-refs.js";
 
 const host = process.env.HOST ?? "127.0.0.1";
 const allowDemoAuth = process.env.ALLOW_DEMO_AUTH === "1";
@@ -203,6 +222,9 @@ async function bootstrapStorage() {
   await ensureCommentStorage();
   await ensurePaperStorage();
   await ensurePaperHighlightStorage();
+  await ensurePaperNoteStorage();
+  await ensurePaperReportStorage();
+  await ensurePaperReportJobStorage();
 }
 
 function sendJson(response, statusCode, payload) {
@@ -224,7 +246,7 @@ function inferErrorCode(error) {
     return { statusCode: 401, code: ERROR_CODE.unauthorized };
   }
 
-  if (message.includes("已存在")) {
+  if (message.includes("已存在") || message.includes("已注册")) {
     return { statusCode: 409, code: ERROR_CODE.conflict };
   }
 
@@ -421,6 +443,93 @@ async function tryAppendVersionEvent(event) {
   }
 }
 
+function resolvePaperReportTtlHours() {
+  const rawValue = String(process.env.PAPER_REPORT_TTL_HOURS ?? "168").trim();
+  const parsed = Number(rawValue);
+  if (!Number.isFinite(parsed)) {
+    return 168;
+  }
+  return Math.max(1, Math.min(Math.floor(parsed), 24 * 30));
+}
+
+function mapPaperReportJobStatusToResponse(status) {
+  if (status === "pending") {
+    return "queued";
+  }
+  if (status === "running") {
+    return "running";
+  }
+  if (status === "ready" || status === "degraded" || status === "failed") {
+    return status;
+  }
+  return "failed";
+}
+
+function isPaperReportStale(report) {
+  if (!report) {
+    return false;
+  }
+
+  const nowMs = Date.now();
+  if (report.expiresAt) {
+    const expiresAtMs = Date.parse(String(report.expiresAt));
+    if (Number.isFinite(expiresAtMs) && expiresAtMs <= nowMs) {
+      return true;
+    }
+  }
+
+  const generatedAtMs = Date.parse(String(report.generatedAt ?? report.updatedAt ?? ""));
+  if (!Number.isFinite(generatedAtMs)) {
+    return true;
+  }
+  const ttlMs = resolvePaperReportTtlHours() * 3600 * 1000;
+  return generatedAtMs + ttlMs <= nowMs;
+}
+
+function buildPaperReportState({
+  status,
+  isStale = false,
+  jobId = null,
+  errorMessage = null,
+  updatedAt = null,
+}) {
+  return {
+    status,
+    isStale,
+    jobId,
+    errorMessage,
+    updatedAt,
+  };
+}
+
+async function resolveCanonicalPaperIdForReport(paperId) {
+  const normalized = splitPaperReference(paperId).paperId;
+  try {
+    const detail = await loadPaperDetails(normalized, 6000);
+    return {
+      canonicalPaperId: detail.paperId,
+      sourcePaperId: normalized,
+      paper: detail,
+    };
+  } catch (error) {
+    const parsed = splitPaperReference(normalized);
+    const message = error instanceof Error ? error.message : String(error);
+    if (parsed.source === "openalex" && message.includes("未找到可读来源")) {
+      const metadata = await loadPaperMetadata(normalized, 6000);
+      return {
+        canonicalPaperId: metadata.paperId,
+        sourcePaperId: normalized,
+        paper: metadata,
+      };
+    }
+    return {
+      canonicalPaperId: normalized,
+      sourcePaperId: normalized,
+      paper: null,
+    };
+  }
+}
+
 function serializeProjectSummary(project, currentUserId) {
   const currentMember = (project.members ?? []).find((member) => member.userId === currentUserId) ?? null;
 
@@ -477,10 +586,10 @@ function includesSearchText(values, query) {
 function buildCommandSearchItems({ hasActiveProject }) {
   const commands = [
     {
-      id: "go-explore",
-      title: "进入探索页",
+      id: "go-templates",
+      title: "进入模板库",
       subtitle: "查看平台模板与示例工程，并从模板创建新项目",
-      keywords: ["探索", "模板", "template", "gallery"],
+      keywords: ["模板库", "探索", "模板", "template", "gallery"],
     },
     {
       id: "create-project",
@@ -489,10 +598,10 @@ function buildCommandSearchItems({ hasActiveProject }) {
       keywords: ["新建", "项目", "create", "project"],
     },
     {
-      id: "open-paper-search",
-      title: "打开论文检索",
-      subtitle: "切换到论文检索面板，搜索多源论文结果",
-      keywords: ["论文", "检索", "arxiv", "pubmed", "semantic scholar", "paper"],
+      id: "open-search",
+      title: "打开论文搜索页",
+      subtitle: "进入独立论文搜索页面，检索多源论文结果并直接开始阅读",
+      keywords: ["搜索", "论文", "检索", "arxiv", "pubmed", "openalex", "paper"],
     },
   ];
 
@@ -589,15 +698,17 @@ async function searchGlobalResourcesForUser(user, { query, projectId }) {
 
   if (normalizedQuery.length >= 3) {
     try {
-      const externalPapers = await searchPapers(query, 4);
-      externalPaperItems = externalPapers.map((paper) => ({
-        id: `external-paper:${paper.paperId}`,
-        type: "external-paper",
-        title: paper.title,
-        subtitle: `${paper.authors.slice(0, 3).join(", ")} · ${paper.published ?? "Unknown"}`,
-        sourceLabel: `外部论文 / ${paper.sourceLabel ?? paper.source ?? "Unknown"}`,
-        paperId: paper.paperId,
-      }));
+      const externalSearch = await searchPapers(query, 4);
+      externalPaperItems = (externalSearch.results ?? [])
+        .filter((paper) => ["arxiv", "pubmed", "openalex"].includes(paper.source))
+        .map((paper) => ({
+          id: `external-paper:${paper.paperId}`,
+          type: "external-paper",
+          title: paper.title,
+          subtitle: `${paper.authors.slice(0, 3).join(", ")} · ${paper.published ?? "Unknown"}`,
+          sourceLabel: `外部论文 / ${paper.sourceLabel ?? paper.source ?? "Unknown"}`,
+          paperId: paper.paperId,
+        }));
     } catch (error) {
       console.warn("Global search external paper lookup failed:", error);
     }
@@ -1250,7 +1361,7 @@ async function handleApiRequest(request, response, url) {
     }
 
     sendJson(response, 200, {
-      results: await searchPapers(query, Number(body.limit ?? 6), Array.isArray(body.sources) ? body.sources : []),
+      ...(await searchPapers(query, Number(body.limit ?? 200), Array.isArray(body.sources) ? body.sources : [])),
     });
     return true;
   }
@@ -1302,8 +1413,32 @@ async function handleApiRequest(request, response, url) {
       return true;
     }
 
-    const paper = await loadPaperDetails(paperId, 12000);
-    const bibtexPayload = await generatePaperBibtex(paperId);
+    const paperReference = splitPaperReference(paperId);
+    let paper;
+
+    try {
+      paper = await loadPaperDetails(paperId, 12000);
+    } catch (error) {
+      if (paperReference.source !== "openalex" || !String(error?.message ?? error).includes("未找到可读来源")) {
+        throw error;
+      }
+      paper = await loadPaperMetadata(paperId, 6000);
+    }
+
+    const canonicalRecord = await getProjectPaper(projectId, paper.paperId);
+
+    if (canonicalRecord) {
+      sendJson(response, 200, {
+        paper: canonicalRecord,
+        reference: {
+          bibFilePath: canonicalRecord.bibFilePath,
+          bibtexKey: canonicalRecord.bibtexKey,
+        },
+      });
+      return true;
+    }
+
+    const bibtexPayload = await generatePaperBibtex(paper.paperId);
     const bibResult = await upsertProjectBibFile(projectId, bibFilePath, bibtexPayload.bibtex, bibtexPayload.citeKey);
     const record = await upsertProjectPaper(projectId, {
       ...paper,
@@ -1342,6 +1477,249 @@ async function handleApiRequest(request, response, url) {
         bibtexKey: bibResult.bibtexKey,
       },
     });
+    return true;
+  }
+
+  const projectPaperReportEnsureMatch = pathname.match(/^\/api\/projects\/([^/]+)\/papers\/([^/]+)\/report\/ensure$/);
+
+  if (projectPaperReportEnsureMatch && request.method === "POST") {
+    const projectId = projectPaperReportEnsureMatch[1];
+    const sourcePaperId = decodeURIComponent(projectPaperReportEnsureMatch[2]);
+    await requireProjectAccess(projectId, authenticatedUser);
+    const body = await readRequestBody(request);
+    const reportEnabled = String(process.env.PAPER_REPORT_ENABLED ?? "1").trim() !== "0";
+
+    if (!reportEnabled) {
+      sendJson(response, 200, {
+        state: buildPaperReportState({
+          status: "failed",
+          isStale: false,
+          errorMessage: "论文报告功能当前未开启",
+          updatedAt: new Date().toISOString(),
+        }),
+        report: null,
+      });
+      return true;
+    }
+
+    const resolved = await resolveCanonicalPaperIdForReport(sourcePaperId);
+    const cachedReport = await getPaperReport(resolved.canonicalPaperId);
+    const stale = cachedReport ? isPaperReportStale(cachedReport) : false;
+
+    if (cachedReport && !stale) {
+      sendJson(response, 200, {
+        state: buildPaperReportState({
+          status: cachedReport.status,
+          isStale: false,
+          updatedAt: cachedReport.updatedAt,
+        }),
+        report: cachedReport,
+      });
+      return true;
+    }
+
+    const jobResult = await createOrReusePaperReportJob({
+      projectId,
+      paperId: resolved.sourcePaperId,
+      canonicalPaperId: resolved.canonicalPaperId,
+      requestedByUserId: authenticatedUser.id,
+      forceRegenerate: false,
+      maxAttempts: Number(body.maxAttempts ?? 3),
+    });
+    const responseStatus = mapPaperReportJobStatusToResponse(jobResult.job.status);
+
+    sendJson(response, 200, {
+      state: buildPaperReportState({
+        status: responseStatus,
+        isStale: stale,
+        jobId: jobResult.job.id,
+        updatedAt: jobResult.job.updatedAt,
+      }),
+      report: cachedReport,
+    });
+    return true;
+  }
+
+  const projectPaperReportMatch = pathname.match(/^\/api\/projects\/([^/]+)\/papers\/([^/]+)\/report$/);
+
+  if (projectPaperReportMatch && request.method === "GET") {
+    const projectId = projectPaperReportMatch[1];
+    const sourcePaperId = decodeURIComponent(projectPaperReportMatch[2]);
+    await requireProjectAccess(projectId, authenticatedUser);
+    const resolved = await resolveCanonicalPaperIdForReport(sourcePaperId);
+    const cachedReport = await getPaperReport(resolved.canonicalPaperId);
+    const activeJob = await getActivePaperReportJob(resolved.canonicalPaperId);
+    const latestJob = activeJob ? activeJob : await getLatestPaperReportJob(resolved.canonicalPaperId);
+    const stale = cachedReport ? isPaperReportStale(cachedReport) : false;
+
+    if (activeJob) {
+      sendJson(response, 200, {
+        state: buildPaperReportState({
+          status: mapPaperReportJobStatusToResponse(activeJob.status),
+          isStale: stale,
+          jobId: activeJob.id,
+          updatedAt: activeJob.updatedAt,
+        }),
+        report: cachedReport,
+      });
+      return true;
+    }
+
+    if (cachedReport) {
+      sendJson(response, 200, {
+        state: buildPaperReportState({
+          status: cachedReport.status,
+          isStale: stale,
+          updatedAt: cachedReport.updatedAt,
+        }),
+        report: cachedReport,
+      });
+      return true;
+    }
+
+    if (latestJob) {
+      sendJson(response, 200, {
+        state: buildPaperReportState({
+          status: mapPaperReportJobStatusToResponse(latestJob.status),
+          isStale: false,
+          jobId: latestJob.id,
+          errorMessage: latestJob.errorMessage,
+          updatedAt: latestJob.updatedAt,
+        }),
+        report: null,
+      });
+      return true;
+    }
+
+    sendJson(response, 200, {
+      state: buildPaperReportState({
+        status: "failed",
+        isStale: false,
+        errorMessage: "报告尚未生成，请先触发生成",
+        updatedAt: new Date().toISOString(),
+      }),
+      report: null,
+    });
+    return true;
+  }
+
+  const projectPaperReportRegenerateMatch = pathname.match(/^\/api\/projects\/([^/]+)\/papers\/([^/]+)\/report\/regenerate$/);
+
+  if (projectPaperReportRegenerateMatch && request.method === "POST") {
+    const projectId = projectPaperReportRegenerateMatch[1];
+    const sourcePaperId = decodeURIComponent(projectPaperReportRegenerateMatch[2]);
+    await requireProjectAccess(projectId, authenticatedUser, { permission: PROJECT_PERMISSION.comment });
+    const body = await readRequestBody(request);
+    const resolved = await resolveCanonicalPaperIdForReport(sourcePaperId);
+    const jobResult = await createOrReusePaperReportJob({
+      projectId,
+      paperId: resolved.sourcePaperId,
+      canonicalPaperId: resolved.canonicalPaperId,
+      requestedByUserId: authenticatedUser.id,
+      forceRegenerate: true,
+      maxAttempts: Number(body.maxAttempts ?? 3),
+    });
+
+    sendJson(response, 202, {
+      state: buildPaperReportState({
+        status: mapPaperReportJobStatusToResponse(jobResult.job.status),
+        isStale: false,
+        jobId: jobResult.job.id,
+        updatedAt: jobResult.job.updatedAt,
+      }),
+      report: null,
+    });
+    return true;
+  }
+
+  const projectPaperNotesMatch = pathname.match(/^\/api\/projects\/([^/]+)\/papers\/([^/]+)\/notes$/);
+
+  if (projectPaperNotesMatch && request.method === "GET") {
+    const projectId = projectPaperNotesMatch[1];
+    const paperId = decodeURIComponent(projectPaperNotesMatch[2]);
+    await requireProjectAccess(projectId, authenticatedUser);
+    sendJson(response, 200, {
+      notes: await listProjectPaperNotes(projectId, paperId),
+    });
+    return true;
+  }
+
+  if (projectPaperNotesMatch && request.method === "POST") {
+    const projectId = projectPaperNotesMatch[1];
+    const paperId = decodeURIComponent(projectPaperNotesMatch[2]);
+    await requireProjectAccess(projectId, authenticatedUser, { permission: PROJECT_PERMISSION.comment });
+    const body = await readRequestBody(request);
+    const note = await createProjectPaperNote(projectId, {
+      paperId,
+      title: body.title ?? "",
+      text: body.text ?? "",
+      anchorId: body.anchorId ?? null,
+      pageNumber: body.pageNumber ?? null,
+      contextText: body.contextText ?? null,
+      createdByUserId: authenticatedUser.id,
+      createdByName: authenticatedUser.name,
+    });
+    await tryAppendAuditLog({
+      actorUserId: authenticatedUser.id,
+      projectId,
+      action: "paper.note.create",
+      targetType: "paper_note",
+      targetId: note.id,
+      payload: {
+        paperId: note.paperId,
+        anchorId: note.anchorId,
+      },
+    });
+    sendJson(response, 201, { note });
+    return true;
+  }
+
+  const projectPaperNoteDetailMatch = pathname.match(/^\/api\/projects\/([^/]+)\/papers\/([^/]+)\/notes\/([^/]+)$/);
+
+  if (projectPaperNoteDetailMatch && request.method === "PATCH") {
+    const projectId = projectPaperNoteDetailMatch[1];
+    const paperId = decodeURIComponent(projectPaperNoteDetailMatch[2]);
+    const noteId = decodeURIComponent(projectPaperNoteDetailMatch[3]);
+    await requireProjectAccess(projectId, authenticatedUser, { permission: PROJECT_PERMISSION.comment });
+    const body = await readRequestBody(request);
+    const note = await updateProjectPaperNote(projectId, paperId, noteId, {
+      title: body.title,
+      text: body.text,
+      anchorId: body.anchorId,
+      pageNumber: body.pageNumber,
+      contextText: body.contextText,
+    });
+    await tryAppendAuditLog({
+      actorUserId: authenticatedUser.id,
+      projectId,
+      action: "paper.note.update",
+      targetType: "paper_note",
+      targetId: note.id,
+      payload: {
+        paperId: note.paperId,
+      },
+    });
+    sendJson(response, 200, { note });
+    return true;
+  }
+
+  if (projectPaperNoteDetailMatch && request.method === "DELETE") {
+    const projectId = projectPaperNoteDetailMatch[1];
+    const paperId = decodeURIComponent(projectPaperNoteDetailMatch[2]);
+    const noteId = decodeURIComponent(projectPaperNoteDetailMatch[3]);
+    await requireProjectAccess(projectId, authenticatedUser, { permission: PROJECT_PERMISSION.comment });
+    const note = await deleteProjectPaperNote(projectId, paperId, noteId);
+    await tryAppendAuditLog({
+      actorUserId: authenticatedUser.id,
+      projectId,
+      action: "paper.note.delete",
+      targetType: "paper_note",
+      targetId: note.id,
+      payload: {
+        paperId: note.paperId,
+      },
+    });
+    sendJson(response, 200, { note, success: true });
     return true;
   }
 
@@ -1799,6 +2177,7 @@ async function handleApiRequest(request, response, url) {
     const body = await readRequestBody(request);
     const highlight = await createProjectPaperHighlight(projectId, {
       paperId,
+      kind: body.kind,
       content: body.content ?? {},
       comment: body.comment ?? {},
       position: body.position ?? {},
@@ -1841,6 +2220,7 @@ async function handleApiRequest(request, response, url) {
     await requireProjectAccess(projectId, authenticatedUser, { permission: PROJECT_PERMISSION.comment });
     const body = await readRequestBody(request);
     const highlight = await updateProjectPaperHighlight(projectId, paperId, highlightId, {
+      kind: body.kind,
       comment: body.comment ?? {},
       content: body.content ?? {},
     });
@@ -2176,4 +2556,6 @@ if (isMainModule) {
  * - 项目访问控制统一收敛在 API 与协作入口，避免“HTTP 拦住了但 WebSocket 能绕过”的权限裂缝。
  * - 静态资源与 API 同进程托管降低了部署复杂度，但高并发阶段应拆出独立前端服务或 CDN。
  * - 自动检查点扫描挂在 API 进程内，适合当前单实例阶段；后续多实例部署时应迁移到独立调度器。
+ * - 全局命令搜索的文案和命令 ID 现在对齐“模板库 / 搜索 / 写作工作台 / 论文阅读”的新顶栏结构，但前端仍兼容旧命令别名，避免历史入口立即失效。
+ * - 论文报告接口采用“API 编排 + worker 执行 + 全局缓存”三段式，避免把长耗时生成塞进同步请求导致阅读页卡死。
  */

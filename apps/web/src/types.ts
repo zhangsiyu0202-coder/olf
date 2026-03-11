@@ -14,7 +14,7 @@
  *   - TypeScript 类型系统
  *
  * Last Updated:
- *   - 2026-03-08 by Codex - 升级论文类型为多源统一结构
+ *   - 2026-03-11 by Codex - 新增论文报告与论文私有笔记类型
  */
 
 export interface ProjectSummary {
@@ -104,6 +104,22 @@ export interface PaperSearchResult {
   accessStatus?: string;
 }
 
+export interface PaperSourceStatus {
+  source: string;
+  sourceLabel: string;
+  ok: boolean;
+  resultCount: number;
+  durationMs: number;
+  errorCode?: string | null;
+  errorMessage?: string | null;
+}
+
+export interface PaperSearchResponse {
+  results: PaperSearchResult[];
+  sources: string[];
+  sourceStatuses: PaperSourceStatus[];
+}
+
 export interface ProjectPaperRecord extends PaperSearchResult {
   bibtex: string;
   bibtexKey: string;
@@ -125,10 +141,73 @@ export interface PaperAssistantReply {
   model: string;
 }
 
+export interface PaperReportAnchor {
+  id: string;
+  chunkId: string;
+  excerpt: string;
+  pageNumber: number | null;
+  score: number | null;
+}
+
+export interface PaperReportSection {
+  id: string;
+  title: string;
+  content: string;
+  anchorIds: string[];
+  confidence: "high" | "medium" | "low";
+}
+
+export interface PaperReport {
+  reportId: string;
+  canonicalPaperId: string;
+  paperId: string;
+  sourcePaperId: string | null;
+  title: string;
+  summary: string;
+  sections: PaperReportSection[];
+  anchors: PaperReportAnchor[];
+  markdown: string;
+  constraints: {
+    passed: boolean;
+    score: number;
+    failedRules: string[];
+  };
+  status: "ready" | "degraded";
+  model: string;
+  engine: string;
+  generatedAt: string;
+  expiresAt: string | null;
+  updatedAt: string;
+}
+
+export interface PaperReportState {
+  status: "queued" | "running" | "ready" | "degraded" | "failed";
+  isStale: boolean;
+  jobId: string | null;
+  errorMessage: string | null;
+  updatedAt: string | null;
+}
+
+export interface PaperNote {
+  id: string;
+  projectId: string;
+  paperId: string;
+  title: string;
+  text: string;
+  anchorId: string | null;
+  pageNumber: number | null;
+  contextText: string | null;
+  createdByUserId: string | null;
+  createdByName: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
 export interface ProjectPaperHighlight {
   id: string;
   projectId: string;
   paperId: string;
+  kind: "highlight" | "comment";
   content: {
     text: string;
     image?: string;

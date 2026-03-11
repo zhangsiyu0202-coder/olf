@@ -103,7 +103,7 @@ docker compose -f infra/docker-compose.app.yml down -v
 
 - 对外端口：`8090`
 - 供主站调用，也可直接访问 `/health`
-- 支持 `arXiv / Semantic Scholar / PubMed`
+- 支持 `arXiv / PubMed / OpenAlex`
 
 ### 6.4 存储
 

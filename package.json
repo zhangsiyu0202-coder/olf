@@ -13,12 +13,13 @@
     "node": ">=20.0.0"
   },
   "scripts": {
-    "start": "node apps/api/src/server.js",
-    "dev:api": "sh -c 'PORT=\"${API_PORT:-3000}\" node apps/api/src/server.js'",
-    "dev:paper-service": "sh -c '.venv/bin/uvicorn main:app --app-dir apps/paper-service --host \"${PAPER_SERVICE_BIND_HOST:-127.0.0.1}\" --port \"${PAPER_SERVICE_PORT:-8090}\"'",
+    "start": "node --env-file=.env apps/api/src/server.js",
+    "dev:api": "sh -c 'PORT=\"${API_PORT:-3000}\" node --env-file=.env apps/api/src/server.js'",
+    "dev:paper-service": "sh -c 'PAPER_SERVICE_VENV=\"${PAPER_SERVICE_VENV:-.venv-paper-service}\"; if [ ! -x \"$PAPER_SERVICE_VENV/bin/uvicorn\" ]; then PAPER_SERVICE_VENV=.venv; fi; \"$PAPER_SERVICE_VENV/bin/uvicorn\" main:app --app-dir apps/paper-service --host \"${PAPER_SERVICE_BIND_HOST:-127.0.0.1}\" --port \"${PAPER_SERVICE_PORT:-8090}\"'",
     "dev:web": "npm run dev --workspace @overleaf-clone/web",
-    "dev:worker": "node workers/compiler/src/worker.js",
-    "dev:worker:docker": "COMPILE_EXECUTION_MODE=docker node workers/compiler/src/worker.js",
+    "dev:worker": "node --env-file=.env workers/compiler/src/worker.js",
+    "dev:worker:paper-report": "node --env-file=.env workers/paper-report/src/worker.js",
+    "dev:worker:docker": "COMPILE_EXECUTION_MODE=docker node --env-file=.env workers/compiler/src/worker.js",
     "dev:stack": "bash scripts/dev-stack.sh",
     "build:web": "npm run build --workspace @overleaf-clone/web",
     "test:smoke": "node scripts/smoke-test.js",

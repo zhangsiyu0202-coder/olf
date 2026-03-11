@@ -25,12 +25,20 @@
 
 - 多源搜索
   - `arXiv`
-  - `Semantic Scholar`
   - `PubMed`
+- 发现源搜索
+  - `OpenAlex`
 - 单篇论文详情
 - BibTeX 生成
 - PDF 代理与缓存
 - 研究场景 Agent
+- 结构化论文报告生成（DSPy 约束链路）
+
+说明：
+
+- `OpenAlex` 只承担发现源职责；阅读时会自动尝试解析到 `arXiv / PubMed`。
+- 解析只接受 DOI、arXiv ID、PMID、PMCID 这类显式标识符，不做标题弱匹配。
+- 如果 discovery 结果无法解析到可读源，阅读接口会直接返回 `未找到可读来源`。
 
 ## 3. 部署前你需要准备什么
 
@@ -73,7 +81,7 @@ npm install
 ```bash
 python3 -m venv .venv
 .venv/bin/pip install --upgrade pip
-.venv/bin/pip install fastapi uvicorn httpx langchain langchain-community langchain-openai arxiv pymupdf semanticscholar xmltodict
+.venv/bin/pip install fastapi uvicorn httpx "langchain==1.2.10" "langchain-community==0.4.1" "langchain-openai==1.1.10" arxiv biopython pyalex pymupdf xmltodict "dspy>=2.6,<3"
 ```
 
 如果仓库当前 `.venv` 已经可用，可以跳过这一步。
@@ -107,10 +115,20 @@ curl http://127.0.0.1:8090/health
 ```bash
 curl -X POST http://127.0.0.1:8090/v1/search \
   -H 'content-type: application/json' \
-  --data '{"query":"multimodal reasoning","limit":4,"sources":["arxiv","semantic_scholar","pubmed"]}'
+  --data '{"query":"multimodal reasoning","limit":4,"sources":["arxiv","pubmed","openalex"]}'
 ```
 
-如果返回包含 `results` 数组和 `source/sourceLabel/sourceId` 字段，说明多源搜索已通。
+如果返回包含 `results` 数组、统一的 `source/sourceLabel/sourceId` 字段，以及 `sourceStatuses`，说明多源搜索和来源状态汇总都已打通。
+
+### 第六步：启动论文报告 worker（主站侧）
+
+论文报告是异步任务，不由 `paper-service` 自己消费。你需要在主站机器额外启动：
+
+```bash
+npm run dev:worker:paper-report
+```
+
+如果不启动这个 worker，报告接口会停留在 `queued/running`，不会自动变成 `ready/degraded`。
 
 ## 5. 在香港服务器上部署论文搜索服务
 
@@ -149,7 +167,7 @@ npm install
 
 python3 -m venv .venv
 .venv/bin/pip install --upgrade pip
-.venv/bin/pip install fastapi uvicorn httpx langchain langchain-community langchain-openai arxiv pymupdf semanticscholar xmltodict
+.venv/bin/pip install fastapi uvicorn httpx "langchain==1.2.10" "langchain-community==0.4.1" "langchain-openai==1.1.10" arxiv biopython pyalex pymupdf xmltodict "dspy>=2.6,<3"
 
 cat >/etc/systemd/system/overleaf-paper.service <<'SERVICE'
 [Unit]
@@ -232,7 +250,7 @@ npm install
 ```bash
 python3 -m venv .venv
 .venv/bin/pip install --upgrade pip
-.venv/bin/pip install fastapi uvicorn httpx langchain langchain-community langchain-openai arxiv pymupdf semanticscholar xmltodict
+.venv/bin/pip install fastapi uvicorn httpx "langchain==1.2.10" "langchain-community==0.4.1" "langchain-openai==1.1.10" arxiv biopython pyalex pymupdf xmltodict
 ```
 
 ### 第六步：启动论文搜索服务
@@ -252,6 +270,13 @@ python3 -m venv .venv
 export AI_API_KEY=你的模型Key
 export AI_BASE_URL=https://api.deepseek.com/v1
 export AI_MODEL_NAME=deepseek-chat
+```
+
+如果你要调整搜索重排行为，可额外配置：
+
+```bash
+export PAPER_RERANK_MODE=heuristic   # heuristic 或 none，默认 heuristic
+export PAPER_RERANK_TOP_K=200        # 仅重排前 K 条，范围 1..500，默认 200
 ```
 
 然后再启动：
@@ -360,6 +385,7 @@ npm run dev:api
 - 打开论文详情时调香港论文服务
 - 导入 BibTeX 时调香港论文服务
 - 打开 PDF 时先调香港论文服务，再由主站本地缓存
+- 论文阅读页打开时异步触发报告生成，并由 `paper-report worker` 消费任务
 
 ## 9. 论文服务接口一览
 
@@ -381,10 +407,15 @@ Content-Type: application/json
 ```json
 {
   "query": "multimodal reasoning",
-  "limit": 6,
-  "sources": ["arxiv", "semantic_scholar", "pubmed"]
+  "limit": 200,
+  "sources": ["arxiv", "pubmed", "openalex"]
 }
 ```
+
+说明：
+
+- `limit` 不传时默认是 `200`
+- `limit` 最大允许 `500`
 
 ### 9.3 单篇详情
 
@@ -423,9 +454,31 @@ Content-Type: application/json
 {
   "message": "帮我比较 multimodal reasoning 的代表论文",
   "selectedPaperIds": ["arxiv:2505.04921v2"],
-  "sources": ["arxiv", "semantic_scholar", "pubmed"]
+  "sources": ["arxiv", "pubmed"]
 }
 ```
+
+### 9.7 结构化报告生成
+
+```http
+POST /v1/reports/generate
+Content-Type: application/json
+```
+
+请求体示例：
+
+```json
+{
+  "paperId": "arxiv:2505.04921v2",
+  "maxChars": 24000,
+  "language": "zh-CN"
+}
+```
+
+说明：
+
+- 该接口是“单次执行接口”，不负责队列与缓存状态管理。
+- 主站负责 `ensure/get/regenerate` 编排与任务状态机。
 
 ## 10. 现在前端会看到什么变化
 
@@ -433,7 +486,7 @@ Content-Type: application/json
 
 - 带明确来源标签
 - 聚合多个来源
-- 区分是否可直接获取 PDF
+- 区分 discovery 源与可读源
 - 导入项目文献库时保留来源信息
 
 ## 11. 常见问题
@@ -444,9 +497,9 @@ Content-Type: application/json
 
 常见情况：
 
-- `Semantic Scholar` 只给摘要和元数据
-- `PubMed` 只有摘要，没有 PMC PDF
-- 只有 `arXiv` 或开放 PDF 链接时，才更容易直接读
+- `OpenAlex` 只是发现源，未必能解析到 `arXiv / PubMed`
+- `PubMed` 有时只有摘要，没有 PMC PDF
+- 只有解析到了 `arXiv` 或带 PMC PDF 的 `PubMed` 记录时，才更容易直接读
 
 ### 11.2 为什么主站不直接访问这些海外论文站点？
 

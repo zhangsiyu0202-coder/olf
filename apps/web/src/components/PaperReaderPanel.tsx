@@ -1,25 +1,38 @@
 /*
  * File: PaperReaderPanel.tsx
- * Module: apps/web (论文阅读面板)
+ * Module: apps/web (论文阅读页面主容器)
  *
  * Responsibility:
- *   - 展示当前选中论文的元数据、摘要、可读全文片段和 PDF 阅读器。
- *   - 提供研究助手提问和导入引用入口，形成“读论文 -> 导入写作”的闭环。
+ *   - 组装论文阅读页的三栏布局、工具栏状态机、评论弹层和 AI 弹层。
+ *   - 将持久化批注、写作插入动作和论文阅读 UI 收敛到同一条主流程。
  *
  * Dependencies:
  *   - react
  *   - ./PaperPdfViewer
+ *   - ./paper-reader/*
  *   - ../types
  *
  * Last Updated:
- *   - 2026-03-08 by Codex - 升级为多源论文阅读面板
+ *   - 2026-03-11 by Codex - 升级右侧为 Assistant + Notes 双标签，并接入报告状态与上下文注入
  */
 
-import { useRef, useState } from "react";
+import { useEffect, useMemo, useReducer, useRef, useState } from "react";
 import PaperPdfViewer, { type PaperPdfViewerHandle } from "./PaperPdfViewer";
+import PaperReaderAssistantPopover from "./paper-reader/PaperReaderAssistantPopover";
+import PaperReaderCenterStage from "./paper-reader/PaperReaderCenterStage";
+import PaperReaderCommentPopover from "./paper-reader/PaperReaderCommentPopover";
+import PaperReaderLeftSidebar from "./paper-reader/PaperReaderLeftSidebar";
+import { buildTextSections, deriveOutlineFromContent, mergePaperOutline, type PaperReaderOutlineItem } from "./paper-reader/paperReaderOutline";
+import PaperReaderRightSidebar, { type AssistantContextItem } from "./paper-reader/PaperReaderRightSidebar";
+import PaperReaderShell from "./paper-reader/PaperReaderShell";
+import { createInitialPaperReaderState, paperReaderReducer, type ReaderSelectionPayload } from "./paper-reader/paperReaderState";
+import PaperReaderTextMode from "./paper-reader/PaperReaderTextMode";
 import type {
   PaperAssistantReply,
   PaperDetail,
+  PaperNote,
+  PaperReport,
+  PaperReportState,
   ProjectPaperHighlight,
   ProjectPaperRecord,
 } from "../types";
@@ -30,15 +43,41 @@ interface PaperReaderPanelProps {
   pdfUrl: string | null;
   isLoading: boolean;
   isImporting: boolean;
-  isAskingAssistant: boolean;
   assistantReply: PaperAssistantReply | null;
+  report: PaperReport | null;
+  reportState: PaperReportState | null;
+  notes: PaperNote[];
+  isAskingAssistant: boolean;
   highlights: ProjectPaperHighlight[];
+  onBackToSearch: () => void;
+  onBackToWorkspace: () => void;
   onImportPaper: (paperId: string) => Promise<void>;
-  onAskAssistant: (message: string, selectedPaperIds: string[]) => Promise<void>;
+  onAskAssistant: (message: string) => Promise<PaperAssistantReply | null>;
+  onAskSelectionAssistant: (selectionText: string, followUp?: string) => Promise<PaperAssistantReply | null>;
+  onRegenerateReport: () => Promise<void>;
   onInsertCitation: () => Promise<void>;
   onInsertSummary: () => Promise<void>;
   onSaveReadingNote: () => Promise<void>;
+  onCreateNote: (payload: {
+    title: string;
+    text: string;
+    anchorId?: string | null;
+    pageNumber?: number | null;
+    contextText?: string | null;
+  }) => Promise<void>;
+  onUpdateNote: (
+    note: PaperNote,
+    patch: {
+      title?: string;
+      text?: string;
+      anchorId?: string | null;
+      pageNumber?: number | null;
+      contextText?: string | null;
+    },
+  ) => Promise<void>;
+  onDeleteNote: (note: PaperNote) => Promise<void>;
   onCreateHighlight: (payload: {
+    kind: "highlight" | "comment";
     content: { text: string; image?: string };
     comment: { text: string; emoji: string };
     position: {
@@ -48,17 +87,13 @@ interface PaperReaderPanelProps {
       usePdfCoordinates?: boolean;
     };
   }) => Promise<void>;
-  onInsertHighlight: (highlight: ProjectPaperHighlight) => Promise<void>;
-  onEditHighlight: (highlight: ProjectPaperHighlight) => Promise<void>;
-  onDeleteHighlight: (highlight: ProjectPaperHighlight) => Promise<void>;
+  onDeleteHighlight: (highlight: ProjectPaperHighlight, options?: { skipConfirm?: boolean }) => Promise<void>;
 }
 
-function formatDate(value: string | null) {
-  if (!value) {
-    return "日期未知";
-  }
-
-  return new Date(value).toLocaleDateString("zh-CN");
+function wait(ms: number) {
+  return new Promise((resolve) => {
+    window.setTimeout(resolve, ms);
+  });
 }
 
 export default function PaperReaderPanel({
@@ -67,173 +102,305 @@ export default function PaperReaderPanel({
   pdfUrl,
   isLoading,
   isImporting,
-  isAskingAssistant,
   assistantReply,
+  report,
+  reportState,
+  notes,
+  isAskingAssistant,
   highlights,
+  onBackToSearch,
+  onBackToWorkspace,
   onImportPaper,
   onAskAssistant,
+  onAskSelectionAssistant,
+  onRegenerateReport,
   onInsertCitation,
   onInsertSummary,
   onSaveReadingNote,
+  onCreateNote,
+  onUpdateNote,
+  onDeleteNote,
   onCreateHighlight,
-  onInsertHighlight,
-  onEditHighlight,
   onDeleteHighlight,
 }: PaperReaderPanelProps) {
-  const [assistantInput, setAssistantInput] = useState("");
+  const [state, dispatch] = useReducer(paperReaderReducer, undefined, createInitialPaperReaderState);
+  const [pdfOutlineItems, setPdfOutlineItems] = useState<PaperReaderOutlineItem[]>([]);
+  const [textScrollTargetId, setTextScrollTargetId] = useState<string | null>(null);
+  const [isSubmittingComment, setIsSubmittingComment] = useState(false);
+  const [assistantContexts, setAssistantContexts] = useState<AssistantContextItem[]>([]);
+  const [latestSelection, setLatestSelection] = useState<ReaderSelectionPayload | null>(null);
   const pdfViewerRef = useRef<PaperPdfViewerHandle | null>(null);
+
+  const textSections = useMemo(() => buildTextSections(paper?.content ?? ""), [paper?.content]);
+  const contentOutline = useMemo(() => deriveOutlineFromContent(paper?.content ?? ""), [paper?.content]);
+  const outlineItems = useMemo(() => mergePaperOutline(pdfOutlineItems, contentOutline), [contentOutline, pdfOutlineItems]);
+
+  useEffect(() => {
+    dispatch({ type: "SET_ACTIVE_OUTLINE", outlineId: outlineItems[0]?.id ?? null });
+  }, [outlineItems]);
+
+  useEffect(() => {
+    dispatch({ type: "RESET" });
+    setPdfOutlineItems([]);
+    setTextScrollTargetId(null);
+    setAssistantContexts([]);
+    setLatestSelection(null);
+  }, [paper?.paperId]);
 
   if (isLoading) {
     return <div className="empty-panel">论文内容加载中...</div>;
   }
 
   if (!paper) {
-    return <div className="empty-panel">先从“检索论文”里打开一篇论文，再进入阅读视图。</div>;
+    return <div className="empty-panel">先从“搜索”页打开一篇论文，再进入阅读视图。</div>;
   }
 
-  return (
-    <div className="paper-reader-layout">
-      <div className="paper-reader-meta">
-        <div className="paper-card">
-          <div className="paper-card-header">
-            <strong>{paper.title}</strong>
-            <small>{formatDate(paper.published)}</small>
-          </div>
-          <p>{paper.authors.join(", ") || "作者未知"}</p>
-          <small>
-            来源：<code>{paper.sourceLabel}</code>
-            {paper.venue ? ` · ${paper.venue}` : ""}
-            {paper.fullTextAvailable ? " · 可直接获取 PDF" : " · 当前仅保证摘要可读"}
-          </small>
-          <pre className="paper-summary">{paper.summary}</pre>
-          <div className="paper-card-actions">
-            <button
-              type="button"
-              className="mini-button"
-              disabled={!!importedPaper || isImporting}
-              onClick={() => void onImportPaper(paper.paperId)}
-            >
-              {importedPaper ? `已导入 · ${importedPaper.bibtexKey}` : isImporting ? "导入中..." : "导入当前项目"}
-            </button>
-            {paper.abstractUrl ? (
-              <a className="mini-link-button" href={paper.abstractUrl} target="_blank" rel="noreferrer">
-                查看来源
-              </a>
-            ) : null}
-            <button type="button" className="mini-button" onClick={() => void onInsertCitation()}>
-              插入 cite
-            </button>
-            <button type="button" className="mini-button" onClick={() => void onInsertSummary()}>
-              插入总结
-            </button>
-            <button type="button" className="mini-button" onClick={() => void onSaveReadingNote()}>
-              保存为笔记
-            </button>
-          </div>
-        </div>
+  async function handleSubmitComment() {
+    if (!state.commentPopover.selection || !state.commentPopover.draft.trim()) {
+      return;
+    }
 
-        <div className="paper-assistant-box">
-          <div className="panel-toolbar">
-            <span>阅读助手</span>
-          </div>
-          <textarea
-            className="assistant-input"
-            placeholder="例如：总结这篇论文的方法、贡献和实验结论"
-            value={assistantInput}
-            onChange={(event) => setAssistantInput(event.target.value)}
+    setIsSubmittingComment(true);
+
+    try {
+      await onCreateHighlight({
+        kind: "comment",
+        content: state.commentPopover.selection.content,
+        comment: {
+          text: state.commentPopover.draft.trim(),
+          emoji: "评论",
+        },
+        position: state.commentPopover.selection.position,
+      });
+      dispatch({ type: "CLOSE_COMMENT_POPOVER" });
+    } finally {
+      setIsSubmittingComment(false);
+    }
+  }
+
+  async function handleRunSelectionAssistant(selectionText: string, followUp = "") {
+    if (!selectionText.trim()) {
+      return;
+    }
+
+    dispatch({ type: "ASSISTANT_REQUEST_START" });
+    const startedAt = Date.now();
+
+    try {
+      const reply = await onAskSelectionAssistant(selectionText.trim(), followUp.trim() || undefined);
+      const elapsed = Date.now() - startedAt;
+
+      if (elapsed < 400) {
+        await wait(400 - elapsed);
+      }
+
+      dispatch({
+        type: "ASSISTANT_REQUEST_SUCCESS",
+        response: reply?.answer?.trim() || "研究助手没有返回可展示的内容。",
+      });
+    } catch (error) {
+      const elapsed = Date.now() - startedAt;
+
+      if (elapsed < 400) {
+        await wait(400 - elapsed);
+      }
+
+      dispatch({
+        type: "ASSISTANT_REQUEST_FAILURE",
+        errorText: error instanceof Error ? error.message : "研究助手暂时不可用，请稍后再试。",
+      });
+    }
+  }
+
+  function pushAssistantContext(text: string, label: string) {
+    const normalizedText = text.trim();
+    if (!normalizedText) {
+      return;
+    }
+    const contextLabel = label.trim() || "上下文";
+    setAssistantContexts((current) => {
+      const next: AssistantContextItem[] = [
+        ...current,
+        {
+          id: `ctx-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+          label: contextLabel,
+          text: normalizedText,
+        },
+      ];
+      return next.slice(-6);
+    });
+  }
+
+  function buildPromptWithInjectedContexts(message: string) {
+    const normalizedMessage = message.trim();
+    if (!normalizedMessage) {
+      return "";
+    }
+    if (assistantContexts.length === 0) {
+      return normalizedMessage;
+    }
+    const contextBlocks = assistantContexts
+      .map((item, index) => `[上下文 ${index + 1} | ${item.label}]\n${item.text}`)
+      .join("\n\n");
+    return `请优先结合以下上下文回答问题。\n\n${contextBlocks}\n\n用户问题：${normalizedMessage}`;
+  }
+
+  function handleOutlineSelect(item: PaperReaderOutlineItem) {
+    dispatch({ type: "SET_ACTIVE_OUTLINE", outlineId: item.id });
+    dispatch({ type: "TOGGLE_MOBILE_OUTLINE", nextValue: false });
+
+    if (item.pageNumber) {
+      dispatch({ type: "SET_READER_MODE", mode: "pdf" });
+      setTextScrollTargetId(null);
+      pdfViewerRef.current?.scrollToPage(item.pageNumber);
+      return;
+    }
+
+    if (item.anchorId) {
+      dispatch({ type: "SET_READER_MODE", mode: "text" });
+      setTextScrollTargetId(item.anchorId);
+      return;
+    }
+
+    window.alert("该目录项暂时不可定位");
+  }
+
+  const leftSidebar = (
+    <PaperReaderLeftSidebar
+      paper={paper}
+      importedPaper={importedPaper}
+      outlineItems={outlineItems}
+      activeOutlineId={state.activeOutlineId}
+      isMetadataExpanded={state.isMetadataExpanded}
+      isImporting={isImporting}
+      onBackToSearch={onBackToSearch}
+      onBackToWorkspace={onBackToWorkspace}
+      onOutlineSelect={handleOutlineSelect}
+      onToggleMetadata={() => dispatch({ type: "TOGGLE_METADATA" })}
+      onImportPaper={() => void onImportPaper(paper.paperId)}
+      onInsertCitation={() => void onInsertCitation()}
+      onInsertSummary={() => void onInsertSummary()}
+      onSaveReadingNote={() => void onSaveReadingNote()}
+    />
+  );
+
+  const rightSidebar = (
+    <PaperReaderRightSidebar
+      assistantReply={assistantReply}
+      report={report}
+      reportState={reportState}
+      notes={notes}
+      assistantContexts={assistantContexts}
+      isAskingAssistant={isAskingAssistant}
+      onAskAssistant={async (message) => {
+        const prompt = buildPromptWithInjectedContexts(message);
+        if (!prompt) {
+          return;
+        }
+        await onAskAssistant(prompt);
+      }}
+      onRegenerateReport={onRegenerateReport}
+      onActivateAssistantSelection={() => {
+        dispatch({ type: "SET_READER_MODE", mode: "pdf" });
+        dispatch({ type: "SET_TOOL", tool: "assistant" });
+      }}
+      onAddLatestSelectionContext={() => {
+        if (!latestSelection?.text?.trim()) {
+          window.alert("请先在 PDF 中选中一段文本，再添加上下文。");
+          return;
+        }
+        pushAssistantContext(latestSelection.text, "选区");
+      }}
+      onRemoveAssistantContext={(contextId) => {
+        setAssistantContexts((current) => current.filter((item) => item.id !== contextId));
+      }}
+      onCreateNote={onCreateNote}
+      onUpdateNote={onUpdateNote}
+      onDeleteNote={onDeleteNote}
+      onUseNoteAsContext={(note) => {
+        pushAssistantContext(note.text, note.title || "笔记");
+      }}
+    />
+  );
+
+  const centerStage = (
+    <PaperReaderCenterStage
+      title={paper.title}
+      subtitle={paper.summary || "当前论文暂无摘要，可直接切到 PDF 或可读全文模式开始阅读。"}
+      readerMode={state.readerMode}
+      activeTool={state.activeTool}
+      zoomLevel={state.zoomLevel}
+      highlightCount={highlights.length}
+      onSetReaderMode={(mode) => dispatch({ type: "SET_READER_MODE", mode })}
+      onSetTool={(tool) => dispatch({ type: "SET_TOOL", tool })}
+      onZoomIn={() => dispatch({ type: "ZOOM_IN" })}
+      onZoomOut={() => dispatch({ type: "ZOOM_OUT" })}
+      onToggleMobileOutline={() => dispatch({ type: "TOGGLE_MOBILE_OUTLINE" })}
+      onToggleMobileInsights={() => dispatch({ type: "TOGGLE_MOBILE_INSIGHTS" })}
+      content={
+        state.readerMode === "pdf" ? (
+          <PaperPdfViewer
+            ref={pdfViewerRef}
+            pdfUrl={pdfUrl}
+            highlights={highlights}
+            activeTool={state.activeTool}
+            zoomLevel={state.zoomLevel}
+            onCreateHighlight={onCreateHighlight}
+            onOpenCommentComposer={(selection) => dispatch({ type: "OPEN_COMMENT_POPOVER", selection })}
+            onOpenAssistantComposer={(selection) => {
+              setLatestSelection(selection);
+              dispatch({ type: "OPEN_ASSISTANT_POPOVER", selection });
+              void handleRunSelectionAssistant(selection.text);
+            }}
+            onEraseHighlight={(highlight) => onDeleteHighlight(highlight, { skipConfirm: true })}
+            onOutlineResolved={setPdfOutlineItems}
           />
-          <div className="assistant-actions">
-            <small>问题会带上当前论文 ID 和来源标签，优先围绕这篇论文回答。</small>
-            <button
-              type="button"
-              className="accent-button"
-              disabled={isAskingAssistant}
-              onClick={() => void onAskAssistant(assistantInput, [paper.paperId])}
-            >
-              {isAskingAssistant ? "分析中..." : "提问"}
-            </button>
-          </div>
-          {assistantReply ? (
-            <div className="assistant-message assistant-message-assistant">
-              <div className="assistant-bubble">
-                <pre>{assistantReply.answer}</pre>
-              </div>
-            </div>
-          ) : null}
-        </div>
+        ) : (
+          <PaperReaderTextMode sections={textSections} scrollTargetId={textScrollTargetId} />
+        )
+      }
+    />
+  );
 
-        <div className="paper-card">
-          <div className="paper-card-header">
-            <strong>可读全文片段</strong>
-            <small>{paper.contentSource}</small>
-          </div>
-          <pre className="paper-reader-content">{paper.content}</pre>
-        </div>
+  return (
+    <>
+      <PaperReaderShell
+        leftSidebar={leftSidebar}
+        centerStage={centerStage}
+        rightSidebar={rightSidebar}
+        mobileOutlineOpen={state.isMobileOutlineOpen}
+        mobileInsightsOpen={state.isMobileInsightsOpen}
+        onCloseMobileOutline={() => dispatch({ type: "TOGGLE_MOBILE_OUTLINE", nextValue: false })}
+        onCloseMobileInsights={() => dispatch({ type: "TOGGLE_MOBILE_INSIGHTS", nextValue: false })}
+      />
 
-        <div className="paper-card">
-          <div className="paper-card-header">
-            <strong>已保存摘录</strong>
-            <small>{highlights.length} 条</small>
-          </div>
-          {highlights.length === 0 ? <small>在右侧 PDF 中框选文本后即可保存摘录。</small> : null}
-          {highlights.map((highlight) => (
-            <div key={highlight.id} className="paper-highlight-card">
-              <div className="paper-highlight-card-header">
-                <strong>{highlight.comment.emoji || "摘录"}</strong>
-                <small>{formatDate(highlight.createdAt)}</small>
-              </div>
-              <p>{highlight.comment.text || "未填写备注"}</p>
-              <pre className="paper-summary">{highlight.content.text}</pre>
-              <div className="assistant-code-actions">
-                <button
-                  type="button"
-                  className="mini-button"
-                  onClick={() => pdfViewerRef.current?.scrollToHighlight(highlight.id)}
-                >
-                  回到 PDF 定位
-                </button>
-                <button
-                  type="button"
-                  className="mini-button"
-                  onClick={() => void onInsertHighlight(highlight)}
-                >
-                  插入写作区
-                </button>
-                <button
-                  type="button"
-                  className="mini-button"
-                  onClick={() => void onEditHighlight(highlight)}
-                >
-                  编辑备注
-                </button>
-                <button
-                  type="button"
-                  className="mini-button"
-                  onClick={() => void onDeleteHighlight(highlight)}
-                >
-                  删除
-                </button>
-              </div>
-            </div>
-          ))}
-        </div>
-      </div>
+      <PaperReaderCommentPopover
+        state={state.commentPopover}
+        isSubmitting={isSubmittingComment}
+        onChangeDraft={(draft) => dispatch({ type: "SET_COMMENT_DRAFT", draft })}
+        onSubmit={() => void handleSubmitComment()}
+        onClose={() => dispatch({ type: "CLOSE_COMMENT_POPOVER" })}
+      />
 
-      <div className="paper-reader-pdf">
-        <PaperPdfViewer
-          ref={pdfViewerRef}
-          pdfUrl={pdfUrl}
-          highlights={highlights}
-          onCreateHighlight={onCreateHighlight}
-        />
-      </div>
-    </div>
+      <PaperReaderAssistantPopover
+        state={state.assistantPopover}
+        onClose={() => dispatch({ type: "CLOSE_ASSISTANT_POPOVER" })}
+        onChangeFollowUp={(followUp) => dispatch({ type: "SET_ASSISTANT_FOLLOW_UP", followUp })}
+        onSubmitFollowUp={() =>
+          void handleRunSelectionAssistant(
+            state.assistantPopover.selection?.text ?? "",
+            state.assistantPopover.followUp,
+          )
+        }
+      />
+    </>
   );
 }
 
 /*
  * Code Review:
- * - 阅读面板把元数据、全文片段和 PDF 视图并置，优先保证“边看边导入”的主流程，而不是先追求复杂标注系统。
- * - 导入状态直接映射到已导入论文记录，避免前端再维护一套本地真假状态。
- * - 研究助手问题显式附带当前论文 ID，减少 Agent 在多论文语境下答非所问的概率。
+ * - `PaperReaderPanel` 只保留编排和业务回调，不再自己承担大段布局与视觉细节，后续维护成本更低。
+ * - 评论和 AI 弹层都围绕同一份 `ReaderSelectionPayload` 运转，能保证选区文本、位置和持久化坐标始终一致。
+ * - outline 现在按“页码优先、锚点回退”的能力模型驱动跳转，避免把没有稳定页码的目录项误导成错误的 PDF 跳页。
+ * - 阅读页“返回搜索”现在直接回顶栏一级搜索页，避免重新把论文搜索塞回工作台右侧工具面板。
  */

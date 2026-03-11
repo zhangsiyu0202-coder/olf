@@ -150,7 +150,7 @@ export async function upsertProjectPaper(projectId, paperRecord) {
 
 /*
  * Code Review:
- * - 论文记录已升级为多源统一结构，`paperId` 不再等同于某个站点的裸 ID，避免 `Semantic Scholar / PubMed` 接入后继续用单源假设污染仓储。
+ * - 论文记录已升级为多源统一结构，`paperId` 不再等同于某个站点的裸 ID，避免 `PubMed / OpenAlex` 接入后继续用单源假设污染仓储。
  * - 写入已切到原子 patch，避免多人同时导入论文时覆盖彼此的项目文献库清单。
  * - BibTeX 与论文元数据一起持久化，避免 API 每次展示项目文献库都重新请求远端；后续若补阅读状态等字段，也应继续收敛在本模块。
  */

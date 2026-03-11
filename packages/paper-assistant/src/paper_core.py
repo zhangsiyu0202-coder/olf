@@ -4,7 +4,7 @@
  *
  * Responsibility:
  *   - 提供多源论文搜索、详情加载、BibTeX 生成、PDF 获取和研究 Agent 的统一核心能力。
- *   - 把 `arXiv`、`Semantic Scholar` 和 `PubMed` 的接入差异收敛在一处，避免 CLI、HTTP 服务和 Node 主站维护多套规则。
+ *   - 把搜索发现层与全文获取层继续收敛在同一边界内，避免 CLI、HTTP 服务和 Node 主站维护多套规则。
  *
  * Runtime Logic Overview:
  *   1. 调用方传入搜索词、论文 ID 或 Agent 问题。
@@ -16,29 +16,29 @@
  *   - 输出：统一论文搜索结果、详情、BibTeX、PDF 字节流和 Agent 回复。
  *
  * Future Extension:
- *   - 后续可继续接入 `Crossref`、`OpenAlex` 等来源，但仍应保持“搜索发现层”和“全文获取层”分离。
+ *   - 后续可继续增强 `OpenAlex` 的元数据补全与去重权重，但仍应保持“搜索发现层”和“全文获取层”分离。
  *   - 去重、排序和缓存若继续增强，也应优先在本模块扩展，而不是散落到 API 或前端。
  *
  * Dependencies:
  *   - httpx
  *   - xmltodict
  *   - arxiv
- *   - semanticscholar
+ *   - paper_resolver
+ *   - search_adapters
+ *   - search_contracts
+ *   - search_orchestrator
  *   - langchain
- *   - langchain-community
  *   - langchain-openai
  *
  * Last Updated:
- *   - 2026-03-08 by Codex - 初始化多源论文搜索、详情与独立服务复用核心
+ *   - 2026-03-11 by Codex - 新增结构化论文报告生成能力（DSPy 约束链路）
 """
 
 from __future__ import annotations
 
 import json
-import math
 import os
 import re
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from typing import Any
 from urllib.parse import quote, urlparse
@@ -49,46 +49,31 @@ import xmltodict
 from langchain.agents import create_agent
 from langchain.tools import tool
 from langchain_community.document_loaders import ArxivLoader
-from langchain_community.retrievers import ArxivRetriever
-from langchain_community.utilities import PubMedAPIWrapper
 from langchain_openai import ChatOpenAI
-from semanticscholar import SemanticScholar
 
-ARXIV_SOURCE = "arxiv"
-SEMANTIC_SCHOLAR_SOURCE = "semantic_scholar"
-PUBMED_SOURCE = "pubmed"
-DEFAULT_SOURCES = [ARXIV_SOURCE, SEMANTIC_SCHOLAR_SOURCE, PUBMED_SOURCE]
-SOURCE_LABELS = {
-    ARXIV_SOURCE: "arXiv",
-    SEMANTIC_SCHOLAR_SOURCE: "Semantic Scholar",
-    PUBMED_SOURCE: "PubMed",
-}
-SEMANTIC_SCHOLAR_FIELDS = [
-    "title",
-    "abstract",
-    "venue",
-    "year",
-    "paperId",
-    "authors",
-    "externalIds",
-    "openAccessPdf",
-    "url",
-]
-PAPER_REQUEST_TIMEOUT_S = max(5.0, float(os.environ.get("PAPER_SOURCE_TIMEOUT_MS", "15000")) / 1000.0)
-SEMANTIC_SCHOLAR_API_URL = "https://api.semanticscholar.org/graph/v1"
+from paper_report import build_report_payload
+from paper_resolver import resolve_readable_paper_id
+from search_adapters.openalex import OPENALEX_API_URL, normalize_openalex_item
+from search_contracts import (
+    ARXIV_SOURCE,
+    DISCOVERY_SOURCES,
+    OPENALEX_SOURCE,
+    PAPER_REQUEST_TIMEOUT_S,
+    PUBMED_SOURCE,
+    SOURCE_LABELS,
+    build_generic_warning,
+    build_paper_id,
+    get_source_label,
+    normalize_authors,
+    normalize_paper_payload,
+    normalize_sources,
+    trim_text,
+)
+from search_orchestrator import search_papers as orchestrate_search_papers
+
 PUBMED_ABSTRACT_URL_TEMPLATE = "https://pubmed.ncbi.nlm.nih.gov/{source_id}/"
 PMC_PDF_URL_TEMPLATE = "https://pmc.ncbi.nlm.nih.gov/articles/{pmcid}/pdf/"
-
-
-def get_source_label(source: str) -> str:
-    return SOURCE_LABELS.get(source, source or "Unknown")
-
-
-def build_paper_id(source: str, source_id: str) -> str:
-    normalized_source_id = str(source_id or "").strip()
-    if not normalized_source_id:
-        raise ValueError("论文来源 ID 不能为空")
-    return f"{source}:{normalized_source_id}"
+AGENT_STABLE_SOURCES = [ARXIV_SOURCE, PUBMED_SOURCE]
 
 
 def parse_paper_id(raw_value: str | None) -> tuple[str, str]:
@@ -107,120 +92,10 @@ def parse_paper_id(raw_value: str | None) -> tuple[str, str]:
         source_id = source_id.strip()
         if source in SOURCE_LABELS and source_id:
             return source, source_id
+        if source and source_id:
+            raise ValueError("当前尚不支持该论文来源")
 
     return ARXIV_SOURCE, value.replace(".pdf", "")
-
-
-def trim_text(value: str | None, max_chars: int) -> str:
-    normalized = (value or "").strip()
-    if len(normalized) <= max_chars:
-        return normalized
-    return f"{normalized[:max_chars]}\n...[truncated]"
-
-
-def normalize_authors(raw_authors: Any) -> list[str]:
-    if isinstance(raw_authors, str):
-        return [item.strip() for item in raw_authors.split(",") if item.strip()]
-    if isinstance(raw_authors, list):
-        normalized_authors: list[str] = []
-        for item in raw_authors:
-            if isinstance(item, dict):
-                name = str(item.get("name") or item.get("Name") or "").strip()
-            else:
-                name = getattr(item, "name", None) or getattr(item, "Name", None) or str(item)
-                name = str(name).strip()
-            if name:
-                normalized_authors.append(name)
-        return normalized_authors
-    return []
-
-
-def normalize_sources(raw_sources: list[str] | None) -> list[str]:
-    selected_sources = []
-    for item in raw_sources or []:
-        normalized = str(item or "").strip().lower()
-        if normalized in SOURCE_LABELS and normalized not in selected_sources:
-            selected_sources.append(normalized)
-    return selected_sources or DEFAULT_SOURCES.copy()
-
-
-def normalize_title_key(title: str | None) -> str:
-    return re.sub(r"[^a-z0-9]+", "", (title or "").lower())
-
-
-def parse_sort_date(value: str | None) -> datetime:
-    if not value:
-        return datetime.min
-
-    normalized = value.strip()
-    for pattern in ("%Y-%m-%d", "%Y/%m/%d", "%Y-%m", "%Y/%m", "%Y"):
-        try:
-            return datetime.strptime(normalized, pattern)
-        except ValueError:
-            continue
-
-    try:
-        return datetime.fromisoformat(normalized.replace("Z", "+00:00"))
-    except ValueError:
-        return datetime.min
-
-
-def dedupe_key_for_paper(paper: dict[str, Any]) -> str:
-    doi = str(paper.get("doi") or "").strip().lower()
-    if doi:
-        return f"doi:{doi}"
-
-    title_key = normalize_title_key(paper.get("title"))
-    published = str(paper.get("published") or "").strip()
-    return f"title:{title_key}:{published}"
-
-
-def build_generic_warning(source: str, pdf_url: str | None) -> str | None:
-    if pdf_url:
-        return None
-    if source == ARXIV_SOURCE:
-        return "当前只获取到摘要和文本片段，PDF 可能暂时不可用。"
-    return f"当前来源仅保证摘要或元数据可读，未发现可直接访问的 {get_source_label(source)} PDF。"
-
-
-def normalize_paper_payload(
-    *,
-    source: str,
-    source_id: str,
-    title: str,
-    authors: list[str],
-    published: str | None,
-    summary: str,
-    abstract_url: str | None,
-    pdf_url: str | None,
-    doi: str | None = None,
-    venue: str | None = None,
-    entry_id: str | None = None,
-    content: str | None = None,
-    content_source: str | None = None,
-    warning: str | None = None,
-) -> dict[str, Any]:
-    paper_id = build_paper_id(source, source_id)
-    return {
-        "paperId": paper_id,
-        "source": source,
-        "sourceLabel": get_source_label(source),
-        "sourceId": source_id,
-        "entryId": entry_id or abstract_url,
-        "title": title.strip() or "Untitled",
-        "authors": authors,
-        "published": published,
-        "summary": summary.strip(),
-        "abstractUrl": abstract_url,
-        "pdfUrl": pdf_url,
-        "doi": doi.strip() if isinstance(doi, str) and doi.strip() else None,
-        "venue": venue.strip() if isinstance(venue, str) and venue.strip() else None,
-        "fullTextAvailable": bool(pdf_url),
-        "accessStatus": "pdf" if pdf_url else "abstract_only",
-        "content": (content or "").strip(),
-        "contentSource": content_source,
-        "warning": warning,
-    }
 
 
 def normalize_arxiv_entry_id(entry_id: str | None, paper_id: str | None = None) -> str | None:
@@ -236,44 +111,6 @@ def build_arxiv_pdf_url(entry_id: str | None, paper_id: str | None = None) -> st
     if not normalized_abs_url:
         return None
     return normalized_abs_url.replace("/abs/", "/pdf/") + ".pdf"
-
-
-def normalize_arxiv_search_document(document: Any) -> dict[str, Any]:
-    metadata = dict(getattr(document, "metadata", {}) or {})
-    raw_entry_id = metadata.get("Entry ID")
-    source_id = str(raw_entry_id or metadata.get("Title") or "").strip()
-    if raw_entry_id:
-        source_id = parse_paper_id(raw_entry_id)[1]
-
-    return normalize_paper_payload(
-        source=ARXIV_SOURCE,
-        source_id=source_id,
-        title=str(metadata.get("Title") or "Untitled"),
-        authors=normalize_authors(metadata.get("Authors")),
-        published=str(metadata.get("Published")) if metadata.get("Published") else None,
-        summary=trim_text(metadata.get("Summary") or getattr(document, "page_content", ""), 1800),
-        abstract_url=normalize_arxiv_entry_id(raw_entry_id, source_id),
-        pdf_url=build_arxiv_pdf_url(raw_entry_id, source_id),
-        content=None,
-        content_source=None,
-        warning=None,
-    )
-
-
-def search_arxiv(query: str, limit: int) -> list[dict[str, Any]]:
-    retriever = ArxivRetriever(
-        load_max_docs=max(1, min(limit, 8)),
-        get_full_documents=False,
-        load_all_available_meta=False,
-    )
-    documents = retriever.invoke(query)
-    results: list[dict[str, Any]] = []
-    for document in documents:
-        try:
-            results.append(normalize_arxiv_search_document(document))
-        except Exception:
-            continue
-    return results
 
 
 def load_arxiv_paper(source_id: str, max_chars: int) -> dict[str, Any]:
@@ -305,140 +142,6 @@ def load_arxiv_paper(source_id: str, max_chars: int) -> dict[str, Any]:
         content_source="arxiv_loader",
         warning=None,
     )
-
-
-def build_semantic_scholar_headers() -> dict[str, str]:
-    headers = {
-        "User-Agent": "overleaf-clone-paper-service/0.1",
-        "Accept": "application/json",
-    }
-    api_key = os.environ.get("SEMANTIC_SCHOLAR_API_KEY", "").strip()
-    if api_key:
-        headers["x-api-key"] = api_key
-    return headers
-
-
-def extract_semantic_external_id(item: dict[str, Any], key: str) -> str | None:
-    external_ids = item.get("externalIds") or {}
-    if isinstance(external_ids, dict):
-        value = external_ids.get(key)
-        if isinstance(value, str) and value.strip():
-            return value.strip()
-    return None
-
-
-def normalize_semantic_scholar_paper(item: dict[str, Any]) -> dict[str, Any]:
-    source_id = str(item.get("paperId") or "").strip()
-    if not source_id:
-        raise ValueError("Semantic Scholar 结果缺少 paperId")
-
-    pdf_url = None
-    open_access_pdf = item.get("openAccessPdf")
-    if isinstance(open_access_pdf, dict):
-        pdf_url = str(open_access_pdf.get("url") or "").strip() or None
-
-    abstract_url = str(item.get("url") or "").strip() or f"https://www.semanticscholar.org/paper/{source_id}"
-    summary = trim_text(str(item.get("abstract") or "暂无摘要"), 2200)
-    return normalize_paper_payload(
-        source=SEMANTIC_SCHOLAR_SOURCE,
-        source_id=source_id,
-        title=str(item.get("title") or "Untitled"),
-        authors=normalize_authors(item.get("authors")),
-        published=str(item.get("year")) if item.get("year") else None,
-        summary=summary,
-        abstract_url=abstract_url,
-        pdf_url=pdf_url,
-        doi=extract_semantic_external_id(item, "DOI"),
-        venue=str(item.get("venue") or "") or None,
-        content=summary,
-        content_source="semantic_scholar_abstract",
-        warning=build_generic_warning(SEMANTIC_SCHOLAR_SOURCE, pdf_url),
-    )
-
-
-def request_semantic_scholar_json(path: str, params: dict[str, Any]) -> dict[str, Any]:
-    with httpx.Client(timeout=PAPER_REQUEST_TIMEOUT_S, follow_redirects=True) as client:
-        response = client.get(
-            f"{SEMANTIC_SCHOLAR_API_URL}{path}",
-            params=params,
-            headers=build_semantic_scholar_headers(),
-        )
-        response.raise_for_status()
-        return response.json()
-
-
-def search_semantic_scholar(query: str, limit: int) -> list[dict[str, Any]]:
-    payload = request_semantic_scholar_json(
-        "/paper/search",
-        {
-            "query": query[:300],
-            "limit": max(1, min(limit, 8)),
-            "fields": ",".join(SEMANTIC_SCHOLAR_FIELDS),
-        },
-    )
-    results: list[dict[str, Any]] = []
-    for item in payload.get("data") or []:
-        try:
-            results.append(normalize_semantic_scholar_paper(item))
-        except Exception:
-            continue
-    return results
-
-
-def load_semantic_scholar_paper(source_id: str, max_chars: int) -> dict[str, Any]:
-    payload = request_semantic_scholar_json(
-        f"/paper/{quote(source_id, safe='')}",
-        {
-            "fields": ",".join(SEMANTIC_SCHOLAR_FIELDS),
-        },
-    )
-    paper = normalize_semantic_scholar_paper(payload)
-    paper["content"] = trim_text(paper["summary"], max_chars)
-    paper["contentSource"] = "semantic_scholar_abstract"
-    return paper
-
-
-def create_pubmed_wrapper(limit: int) -> PubMedAPIWrapper:
-    return PubMedAPIWrapper(
-        top_k_results=max(1, min(limit, 8)),
-        doc_content_chars_max=2200,
-        email=os.environ.get("PUBMED_EMAIL", "your_email@example.com"),
-        api_key=os.environ.get("PUBMED_API_KEY", "").strip(),
-    )
-
-
-def normalize_pubmed_search_result(item: dict[str, Any]) -> dict[str, Any]:
-    source_id = str(item.get("uid") or "").strip()
-    if not source_id:
-        raise ValueError("PubMed 结果缺少 uid")
-
-    summary = trim_text(str(item.get("Summary") or "No abstract available"), 2200)
-    return normalize_paper_payload(
-        source=PUBMED_SOURCE,
-        source_id=source_id,
-        title=str(item.get("Title") or "Untitled"),
-        authors=[],
-        published=str(item.get("Published") or "").strip() or None,
-        summary=summary,
-        abstract_url=PUBMED_ABSTRACT_URL_TEMPLATE.format(source_id=source_id),
-        pdf_url=None,
-        doi=None,
-        venue=None,
-        content=summary,
-        content_source="pubmed_summary",
-        warning=build_generic_warning(PUBMED_SOURCE, None),
-    )
-
-
-def search_pubmed(query: str, limit: int) -> list[dict[str, Any]]:
-    wrapper = create_pubmed_wrapper(limit)
-    results: list[dict[str, Any]] = []
-    for item in wrapper.load(query[:300]):
-        try:
-            results.append(normalize_pubmed_search_result(item))
-        except Exception:
-            continue
-    return results
 
 
 def request_pubmed_xml(source_id: str) -> dict[str, Any]:
@@ -589,64 +292,63 @@ def load_pubmed_paper(source_id: str, max_chars: int) -> dict[str, Any]:
     return paper
 
 
-SEARCH_HANDLERS = {
-    ARXIV_SOURCE: search_arxiv,
-    SEMANTIC_SCHOLAR_SOURCE: search_semantic_scholar,
-    PUBMED_SOURCE: search_pubmed,
+def request_openalex_work(source_id: str) -> dict[str, Any]:
+    params: dict[str, Any] = {}
+    mailto = os.environ.get("OPENALEX_EMAIL", "").strip()
+    if mailto:
+        params["mailto"] = mailto
+
+    try:
+        with httpx.Client(timeout=PAPER_REQUEST_TIMEOUT_S, follow_redirects=True) as client:
+            response = client.get(
+                f"{OPENALEX_API_URL}/{quote(source_id, safe='')}",
+                params=params,
+                headers={"User-Agent": "overleaf-clone-paper-service/0.1"},
+            )
+            response.raise_for_status()
+            return response.json()
+    except httpx.HTTPStatusError as error:
+        if error.response.status_code == 404:
+            raise ValueError("未找到对应的 OpenAlex 论文") from error
+        raise ValueError("获取 OpenAlex 论文详情失败") from error
+    except Exception as error:  # noqa: BLE001
+        raise ValueError("获取 OpenAlex 论文详情失败") from error
+
+
+def load_openalex_metadata(source_id: str) -> dict[str, Any]:
+    item = request_openalex_work(source_id)
+    return normalize_openalex_item(item)
+
+
+def load_openalex_paper(source_id: str, max_chars: int) -> dict[str, Any]:
+    item = request_openalex_work(source_id)
+    base_paper = normalize_openalex_item(item)
+    resolved_paper_id = resolve_readable_paper_id(base_paper, item)
+    if not resolved_paper_id:
+        raise ValueError("未找到可读来源")
+    _, resolved_source_id = parse_paper_id(resolved_paper_id)
+    if resolved_paper_id.startswith(f"{ARXIV_SOURCE}:"):
+        return load_arxiv_paper(resolved_source_id, max_chars)
+    return load_pubmed_paper(resolved_source_id, max_chars)
+
+
+READABLE_LOAD_HANDLERS = {
+    ARXIV_SOURCE: load_arxiv_paper,
+    PUBMED_SOURCE: load_pubmed_paper,
+}
+
+DISCOVERY_METADATA_HANDLERS = {
+    OPENALEX_SOURCE: load_openalex_metadata,
 }
 
 LOAD_HANDLERS = {
-    ARXIV_SOURCE: load_arxiv_paper,
-    SEMANTIC_SCHOLAR_SOURCE: load_semantic_scholar_paper,
-    PUBMED_SOURCE: load_pubmed_paper,
+    **READABLE_LOAD_HANDLERS,
+    OPENALEX_SOURCE: load_openalex_paper,
 }
 
 
 def search_papers(query: str, limit: int, sources: list[str] | None = None) -> dict[str, Any]:
-    normalized_query = str(query or "").strip()
-    if not normalized_query:
-        raise ValueError("论文检索词不能为空")
-
-    normalized_sources = normalize_sources(sources)
-    per_source_limit = max(1, math.ceil(max(1, limit) / max(1, len(normalized_sources))))
-    source_results: dict[str, list[dict[str, Any]]] = {source: [] for source in normalized_sources}
-
-    with ThreadPoolExecutor(max_workers=len(normalized_sources)) as executor:
-        futures = {
-            executor.submit(SEARCH_HANDLERS[source], normalized_query, per_source_limit): source
-            for source in normalized_sources
-        }
-        for future in as_completed(futures):
-            source = futures[future]
-            try:
-                source_results[source] = future.result()
-            except Exception:
-                source_results[source] = []
-
-    merged: list[dict[str, Any]] = []
-    seen_keys: set[str] = set()
-    remaining = True
-    while remaining and len(merged) < max(1, limit):
-        remaining = False
-        for source in normalized_sources:
-            if not source_results[source]:
-                continue
-            remaining = True
-            candidate = source_results[source].pop(0)
-            candidate_key = dedupe_key_for_paper(candidate)
-            if candidate_key in seen_keys:
-                continue
-            seen_keys.add(candidate_key)
-            merged.append(candidate)
-            if len(merged) >= max(1, limit):
-                break
-
-    merged.sort(key=lambda paper: parse_sort_date(paper.get("published")), reverse=True)
-
-    return {
-        "results": merged,
-        "sources": normalized_sources,
-    }
+    return orchestrate_search_papers(query, limit, sources)
 
 
 def load_paper(paper_id: str, max_chars: int) -> dict[str, Any]:
@@ -655,6 +357,38 @@ def load_paper(paper_id: str, max_chars: int) -> dict[str, Any]:
         raise ValueError("当前尚不支持该论文来源")
     return {
         "paper": LOAD_HANDLERS[source](source_id, max_chars),
+    }
+
+
+def load_paper_metadata(paper_id: str, max_chars: int = 6000) -> dict[str, Any]:
+    source, source_id = parse_paper_id(paper_id)
+    if source in DISCOVERY_METADATA_HANDLERS:
+        return {
+            "paper": DISCOVERY_METADATA_HANDLERS[source](source_id),
+        }
+    if source in READABLE_LOAD_HANDLERS:
+        return {
+            "paper": READABLE_LOAD_HANDLERS[source](source_id, max_chars),
+        }
+    raise ValueError("当前尚不支持该论文来源")
+
+
+def load_paper_for_report(paper_id: str, max_chars: int) -> dict[str, Any]:
+    try:
+        return load_paper(paper_id, max_chars)["paper"]
+    except Exception as error:  # noqa: BLE001
+        source, _ = parse_paper_id(paper_id)
+        if source in DISCOVERY_METADATA_HANDLERS and str(error) == "未找到可读来源":
+            return load_paper_metadata(paper_id, min(max_chars, 8000))["paper"]
+        raise
+
+
+def generate_paper_report(paper_id: str, max_chars: int = 24000, language: str = "zh-CN") -> dict[str, Any]:
+    paper = load_paper_for_report(paper_id, max_chars)
+    report = build_report_payload(paper, language=language)
+    return {
+        "paper": paper,
+        "report": report,
     }
 
 
@@ -717,7 +451,17 @@ def build_bibtex(paper_id: str) -> dict[str, Any]:
             "bibtex": bibtex,
         }
 
-    paper = load_paper(paper_id, 6000)["paper"]
+    if source in DISCOVERY_SOURCES:
+        try:
+            resolved_paper = load_paper(paper_id, 6000)["paper"]
+        except ValueError as error:
+            if str(error) != "未找到可读来源":
+                raise
+            paper = load_paper_metadata(paper_id, 6000)["paper"]
+        else:
+            return build_bibtex(resolved_paper["paperId"])
+    else:
+        paper = load_paper(paper_id, 6000)["paper"]
     cite_key, bibtex = build_generic_bibtex_fields(paper)
     return {
         "paperId": paper["paperId"],
@@ -783,11 +527,12 @@ def answer_with_agent(
 ) -> dict[str, Any]:
     model = create_model()
     normalized_sources = normalize_sources(sources)
+    agent_search_sources = [source for source in normalized_sources if source in AGENT_STABLE_SOURCES] or AGENT_STABLE_SOURCES.copy()
 
     @tool
     def search_research_papers(query: str) -> str:
         """Search across configured paper sources and return concise candidate papers."""
-        result = search_papers(query, 6, normalized_sources)
+        result = search_papers(query, 6, agent_search_sources)
         return json.dumps(result["results"], ensure_ascii=False)
 
     @tool
@@ -813,6 +558,7 @@ def answer_with_agent(
         "回答必须使用中文，直接给出结论、代表论文和简明依据。"
         "如果信息不足，要明确说明。"
     )
+
     selected_hint = ""
     if selected_paper_ids:
         selected_hint = f"\n当前阅读上下文中的论文 ID: {', '.join(selected_paper_ids[:5])}"
@@ -842,12 +588,24 @@ def answer_with_agent(
     }
 
 
-def answer_with_fallback(message: str, selected_paper_ids: list[str] | None) -> dict[str, Any]:
+def answer_with_fallback(
+    message: str,
+    selected_paper_ids: list[str] | None,
+    reason: str | None = None,
+) -> dict[str, Any]:
     hint = f" 当前阅读论文: {', '.join(selected_paper_ids[:3])}。" if selected_paper_ids else ""
+    normalized_reason = str(reason or "").strip()
+    if "AI_API_KEY" in normalized_reason or "OPENAI_API_KEY" in normalized_reason:
+        prefix = "当前论文 Agent 未配置远端模型，已回退为本地提示。"
+    elif normalized_reason:
+        prefix = f"当前论文 Agent 远端调用失败（{normalized_reason[:140]}），已回退为本地提示。"
+    else:
+        prefix = "当前论文 Agent 远端调用失败，已回退为本地提示。"
     return {
         "reply": {
             "answer": (
-                "当前论文 Agent 未配置远端模型，已回退为本地提示。"
+                prefix
+                + " "
                 f"{hint}你可以先使用多源论文检索搜索主题，再打开具体论文查看摘要、PDF 或外链全文。"
                 f"\n\n你的问题：{message}"
             ),
@@ -873,4 +631,5 @@ def fetch_paper_pdf(paper_id: str) -> tuple[bytes, str]:
 # Code Review:
 # - 该核心模块明确把“搜索发现源”和“全文获取源”分层，实现上虽然共用统一论文结构，但不会把“能搜到”错误等同为“默认能读到全文”。
 # - 当前多源搜索优先保证来源广度和统一结果结构，排序仍保持轻量；后续若需要更强相关性排序，可继续在这一层补召回重排，而不是让前端拼逻辑。
-# - BibTeX 对 `Semantic Scholar / PubMed` 先走轻量通用格式，优先保证项目文献库可导入；若后续要补足期刊卷期页码，应继续从元数据补全层增强。
+# - `OpenAlex` 现在只承担发现源职责，阅读时必须先解析到 `arXiv / PubMed`，避免继续让低质量发现源污染阅读链路。
+# - discovery 源的 BibTeX 会优先复用解析后的可读源；只有解析失败时才回退到 metadata-only 通用 BibTeX，保证引用导入不断链。

@@ -16,11 +16,12 @@
  *   - @vitejs/plugin-react
  *
  * Last Updated:
- *   - 2026-03-08 by Codex - 将开发代理目标收敛到环境变量，避免前端和 API 端口漂移
+ *   - 2026-03-09 by Codex - 接入 Tailwind Vite 插件，为阅读页使用 Tailwind 工具类做准备
  */
 
 import { defineConfig, loadEnv } from "vite";
 import react from "@vitejs/plugin-react";
+import tailwindcss from "@tailwindcss/vite";
 
 export default defineConfig(({ mode }) => {
   const env = loadEnv(mode, ".", "");
@@ -30,7 +31,7 @@ export default defineConfig(({ mode }) => {
   const apiProxyTarget = env.VITE_API_PROXY_TARGET || `http://127.0.0.1:${apiPort}`;
 
   return {
-    plugins: [react()],
+    plugins: [react(), tailwindcss()],
     server: {
       host: webHost,
       port: Number.isInteger(webPort) && webPort > 0 ? webPort : 5173,

@@ -1,10 +1,12 @@
 fastapi==0.116.1
 uvicorn[standard]==0.35.0
 httpx==0.28.1
-langchain==0.3.27
-langchain-community==0.3.29
-langchain-openai==0.3.32
+langchain==1.2.10
+langchain-community==0.4.1
+langchain-openai==1.1.10
 arxiv==2.2.0
+biopython>=1.84,<2
+pyalex>=0.18,<1
 PyMuPDF==1.26.4
-semanticscholar==0.10.0
 xmltodict==0.14.2
+dspy>=2.6,<3

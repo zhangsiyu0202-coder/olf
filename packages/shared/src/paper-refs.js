@@ -15,15 +15,15 @@
  *   - 无
  *
  * Last Updated:
- *   - 2026-03-08 by Codex - 新增多源论文统一标识与来源标签工具
+ *   - 2026-03-11 by Codex - 收缩为三源来源表
  */
 
-const knownPaperSources = new Set(["arxiv", "semantic_scholar", "pubmed"]);
+const knownPaperSources = new Set(["arxiv", "pubmed", "openalex"]);
 
 const sourceLabels = {
   arxiv: "arXiv",
-  semantic_scholar: "Semantic Scholar",
   pubmed: "PubMed",
+  openalex: "OpenAlex",
 };
 
 export function getPaperSourceLabel(source) {
@@ -65,6 +65,10 @@ export function splitPaperReference(paperId) {
     };
   }
 
+  if (delimiterIndex > 0) {
+    throw new Error("当前尚不支持该论文来源");
+  }
+
   const sourceId = normalizedId.replace(/\.pdf$/i, "");
   return {
     paperId: `arxiv:${sourceId}`,
@@ -81,6 +85,6 @@ export function normalizePaperReference(paperId) {
 /*
  * Code Review:
  * - 多源论文接入后，`paperId` 必须从“某个站点的裸 ID”升级为稳定的跨源引用键，否则仓储、摘录和 API 路由都会继续默认等于 arXiv。
- * - 这里保留了对旧裸 `arXiv` ID 和 `arxiv.org/abs/...` URL 的兼容，避免历史项目立即失效。
- * - 来源标签和解析规则都放在一个无副作用工具里，后续新增 `crossref/openalex` 等来源时，改动面最小。
+ * - 未知 `source:*` 前缀现在会直接报错，避免被错误兜底成 arXiv 并污染项目文献库。
+ * - 来源标签和解析规则都放在一个无副作用工具里，三源入口可以在这里集中维护。
  */

@@ -19,7 +19,7 @@
  *   - packages/shared/paths
  *
  * Last Updated:
- *   - 2026-03-08 by Codex - 兼容多源论文统一标识并保留摘录更新删除能力
+ *   - 2026-03-09 by Codex - 为论文高亮新增 kind 字段并兼容旧记录推断
  */
 
 import crypto from "node:crypto";
@@ -61,16 +61,23 @@ function normalizeHighlightPosition(position) {
 
 function normalizePaperHighlight(record) {
   const identity = splitPaperReference(record.paperId ?? "");
+  const normalizedCommentText = String(record.comment?.text ?? "");
   return {
     id: record.id ?? crypto.randomUUID(),
     projectId: record.projectId,
     paperId: identity.paperId,
+    kind:
+      record.kind === "highlight" || record.kind === "comment"
+        ? record.kind
+        : normalizedCommentText.trim()
+          ? "comment"
+          : "highlight",
     content: {
       text: String(record.content?.text ?? ""),
       image: record.content?.image ? String(record.content.image) : undefined,
     },
     comment: {
-      text: String(record.comment?.text ?? ""),
+      text: normalizedCommentText,
       emoji: String(record.comment?.emoji ?? ""),
     },
     position: normalizeHighlightPosition(record.position),
@@ -121,6 +128,7 @@ export async function createProjectPaperHighlight(projectId, payload) {
     id: crypto.randomUUID(),
     projectId,
     paperId: normalizePaperReference(payload.paperId),
+    kind: payload.kind,
     content: payload.content,
     comment: payload.comment,
     position: payload.position,
@@ -146,6 +154,7 @@ export async function updateProjectPaperHighlight(projectId, paperId, highlightI
 
     matchedRecord = normalizePaperHighlight({
       ...record,
+      kind: payload.kind ?? record.kind,
       comment: {
         ...record.comment,
         ...(payload.comment ?? {}),

@@ -9,7 +9,7 @@
  * Runtime Logic Overview:
  *   1. 启动后加载项目列表并自动选择活动项目。
  *   2. 左侧展示项目、文件树与大纲，中间提供 CodeMirror 编辑器。
- *   3. 右侧统一承载 PDF、AI、快照与编译日志面板。
+ *   3. 工作台右侧以“工具内容区 + 贴边工具栏”承载面板导航，论文阅读作为独立页面视图呈现。
  *
  * Dependencies:
  *   - react
@@ -19,7 +19,7 @@
  *   - ./outline
  *
  * Last Updated:
- *   - 2026-03-08 by Codex - 新增探索页、模板建项目与全局聚合搜索入口
+ *   - 2026-03-11 by Codex - 将论文检索默认规模回收到 200，并保留后端手工扩召回能力
  */
 
 import {
@@ -32,12 +32,12 @@ import {
   useState,
   startTransition,
 } from "react";
-import type { ReactNode } from "react";
 import AuthScreen from "./components/AuthScreen";
 import CodeEditor, { type CodeEditorHandle } from "./components/CodeEditor";
 import ExplorePage from "./components/ExplorePage";
 import GlobalSearchDropdown from "./components/GlobalSearchDropdown";
-import PaperSearchPanel from "./components/PaperSearchPanel";
+import PaperSearchPage from "./components/PaperSearchPage";
+import UserSpacePage from "./components/user-space/UserSpacePage";
 import {
   acceptProjectInvitation,
   addOrganizationMemberByEmail,
@@ -63,13 +63,17 @@ import {
   generateCompileFix,
   getProjectPaper,
   createProjectPaperHighlight,
+  createProjectPaperNote,
+  ensureProjectPaperReport,
   getCurrentUser,
   getCompileJob,
   getAssistantConversation,
   getInvitationPreview,
+  getProjectPaperReport,
   getTemplateDetail,
   importProjectPaper,
   listTemplates,
+  listProjectPaperNotes,
   listProjectPaperHighlights,
   listProjectPaperLibrary,
   getProjectSettings,
@@ -96,12 +100,15 @@ import {
   restoreSnapshot,
   resolveProjectComment,
   replyProjectComment,
+  regenerateProjectPaperReport,
   searchGlobalResources,
   searchProjectPapers,
   streamAssistantChat,
+  updateProjectPaperNote,
   updateProjectPaperHighlight,
   updateProjectFile,
   updateProjectSettings,
+  deleteProjectPaperNote,
 } from "./api";
 import {
   createCollaborationRoomName,
@@ -125,6 +132,10 @@ import type {
   OutlineItem,
   PaperAssistantReply,
   PaperDetail,
+  PaperNote,
+  PaperReport,
+  PaperReportState,
+  PaperSourceStatus,
   ProjectPaperHighlight,
   ProjectTemplateDetail,
   ProjectTemplateSummary,
@@ -142,14 +153,14 @@ import type {
   WorkspaceMembershipRecord,
   WorkspaceSummary,
 } from "./types";
+import type { UserSpaceProjectContext } from "./components/user-space/userSpaceTypes";
 
-type AppView = "explore" | "workspace";
+type AppView = "templates" | "search" | "workspace" | "paper-reader" | "user-space";
+type PrimaryAppView = Exclude<AppView, "user-space">;
 
 type RightTab =
   | "pdf"
   | "assistant"
-  | "paper-search"
-  | "paper-reader"
   | "snapshots"
   | "logs"
   | "comments"
@@ -157,6 +168,19 @@ type RightTab =
   | "audit";
 
 const PaperReaderPanel = lazy(() => import("./components/PaperReaderPanel"));
+const defaultPaperSources = ["arxiv", "pubmed", "openalex"];
+const defaultPaperAssistantSources = ["arxiv", "pubmed"];
+const defaultPaperSearchLimit = 200;
+
+const rightTabDefinitions: Array<{ value: RightTab; label: string }> = [
+  { value: "pdf", label: "PDF 预览" },
+  { value: "assistant", label: "AI 助手" },
+  { value: "snapshots", label: "快照历史" },
+  { value: "logs", label: "编译日志" },
+  { value: "comments", label: "评论批注" },
+  { value: "members", label: "成员邀请" },
+  { value: "audit", label: "审计回放" },
+];
 
 function createAssistantIntro(projectName: string): AssistantMessage {
   return {
@@ -395,14 +419,30 @@ function extractInvitationToken(rawValue: string) {
 
 function resolveInitialAppView(): AppView {
   const view = new URLSearchParams(window.location.search).get("view");
-  return view === "explore" ? "explore" : "workspace";
+  if (view === "templates" || view === "explore") {
+    return "templates";
+  }
+
+  if (view === "search") {
+    return "search";
+  }
+
+  if (view === "user-space") {
+    return "user-space";
+  }
+
+  return "workspace";
 }
 
 function syncAppViewToUrl(view: AppView) {
   const url = new URL(window.location.href);
 
-  if (view === "explore") {
-    url.searchParams.set("view", "explore");
+  if (view === "templates") {
+    url.searchParams.set("view", "templates");
+  } else if (view === "search") {
+    url.searchParams.set("view", "search");
+  } else if (view === "user-space") {
+    url.searchParams.set("view", "user-space");
   } else {
     url.searchParams.delete("view");
   }
@@ -513,22 +553,92 @@ function OutlineButton({ item, onJump }: { item: OutlineItem; onJump: (line: num
 
 function RightTabButton({
   value,
+  label,
   active,
-  children,
   onClick,
 }: {
   value: RightTab;
+  label: string;
   active: boolean;
-  children: ReactNode;
   onClick: (value: RightTab) => void;
 }) {
+  function renderIcon() {
+    switch (value) {
+      case "pdf":
+        return (
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round">
+            <path d="M7 3.5h7l4 4V20a1.5 1.5 0 0 1-1.5 1.5h-9A1.5 1.5 0 0 1 6 20V5A1.5 1.5 0 0 1 7.5 3.5z" />
+            <path d="M14 3.5V8h4" />
+            <path d="M8.5 12.5h7" />
+            <path d="M8.5 16h7" />
+          </svg>
+        );
+      case "assistant":
+        return (
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round">
+            <path d="M12 3.5l1.4 4.1L17.5 9l-4.1 1.4L12 14.5l-1.4-4.1L6.5 9l4.1-1.4L12 3.5z" />
+            <path d="M18.5 14l.9 2.6L22 17.5l-2.6.9-.9 2.6-.9-2.6-2.6-.9 2.6-.9.9-2.6z" />
+            <path d="M5.5 14.5l.8 2.2 2.2.8-2.2.8-.8 2.2-.8-2.2-2.2-.8 2.2-.8.8-2.2z" />
+          </svg>
+        );
+      case "snapshots":
+        return (
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round">
+            <path d="M12 6v6l3.5 2" />
+            <circle cx="12" cy="12" r="7.5" />
+            <path d="M5.5 4.5L3 7" />
+            <path d="M18.5 4.5L21 7" />
+          </svg>
+        );
+      case "logs":
+        return (
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round">
+            <path d="M7 7l-3 3 3 3" />
+            <path d="M11 16h7" />
+            <path d="M11 10h7" />
+            <path d="M7.5 4.5h11A1.5 1.5 0 0 1 20 6v12a1.5 1.5 0 0 1-1.5 1.5h-11A1.5 1.5 0 0 1 6 18V6a1.5 1.5 0 0 1 1.5-1.5z" />
+          </svg>
+        );
+      case "comments":
+        return (
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round">
+            <path d="M6 6.5h12A2.5 2.5 0 0 1 20.5 9v6A2.5 2.5 0 0 1 18 17.5H11l-4.5 3V17.5H6A2.5 2.5 0 0 1 3.5 15V9A2.5 2.5 0 0 1 6 6.5z" />
+            <path d="M8 11h8" />
+            <path d="M8 14h5" />
+          </svg>
+        );
+      case "members":
+        return (
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round">
+            <circle cx="9" cy="9" r="3" />
+            <circle cx="16.5" cy="10" r="2.5" />
+            <path d="M4.5 18c.9-2.4 2.9-3.8 5.5-3.8s4.6 1.4 5.5 3.8" />
+            <path d="M14.5 17.5c.6-1.6 2-2.6 3.8-2.6 1.1 0 2.1.4 2.8 1.1" />
+          </svg>
+        );
+      case "audit":
+        return (
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round">
+            <path d="M12 3.5l7 2.5v5.8c0 4.3-2.7 8.1-7 9.7-4.3-1.6-7-5.4-7-9.7V6z" />
+            <path d="M9.5 12.5l1.7 1.7 3.8-4.2" />
+          </svg>
+        );
+      default:
+        return null;
+    }
+  }
+
   return (
     <button
       type="button"
       className={`right-tab${active ? " right-tab-active" : ""}`}
+      title={label}
+      aria-label={label}
       onClick={() => onClick(value)}
     >
-      {children}
+      <span className="right-tab-icon" aria-hidden="true">
+        {renderIcon()}
+      </span>
     </button>
   );
 }
@@ -539,6 +649,7 @@ export default function App() {
   const globalSearchRef = useRef<HTMLDivElement | null>(null);
   const globalSearchTimerRef = useRef<number | null>(null);
   const [appView, setAppView] = useState<AppView>(resolveInitialAppView);
+  const [lastPrimaryAppView, setLastPrimaryAppView] = useState<PrimaryAppView>("workspace");
   const [authReady, setAuthReady] = useState(false);
   const [sessionUser, setSessionUser] = useState<SessionUser | null>(null);
   const [personalWorkspace, setPersonalWorkspace] = useState<WorkspaceSummary | null>(null);
@@ -551,7 +662,6 @@ export default function App() {
   const [selectedTemplateId, setSelectedTemplateId] = useState<string | null>(null);
   const [selectedTemplate, setSelectedTemplate] = useState<ProjectTemplateDetail | null>(null);
   const [templateQuery, setTemplateQuery] = useState("");
-  const [templateCategory, setTemplateCategory] = useState("all");
   const [templateSourceType, setTemplateSourceType] = useState("all");
   const [isTemplateCatalogLoading, setIsTemplateCatalogLoading] = useState(false);
   const [isTemplateCreating, setIsTemplateCreating] = useState(false);
@@ -581,13 +691,18 @@ export default function App() {
   ]);
   const [projectPaperLibrary, setProjectPaperLibrary] = useState<ProjectPaperRecord[]>([]);
   const [paperSearchResults, setPaperSearchResults] = useState<PaperSearchResult[]>([]);
+  const [paperSearchSourceStatuses, setPaperSearchSourceStatuses] = useState<PaperSourceStatus[]>([]);
   const [activePaper, setActivePaper] = useState<PaperDetail | null>(null);
   const [activePaperHighlights, setActivePaperHighlights] = useState<ProjectPaperHighlight[]>([]);
+  const [activePaperReport, setActivePaperReport] = useState<PaperReport | null>(null);
+  const [activePaperReportState, setActivePaperReportState] = useState<PaperReportState | null>(null);
+  const [activePaperNotes, setActivePaperNotes] = useState<PaperNote[]>([]);
   const [paperAssistantReply, setPaperAssistantReply] = useState<PaperAssistantReply | null>(null);
   const [isPaperSearching, setIsPaperSearching] = useState(false);
   const [isPaperLoading, setIsPaperLoading] = useState(false);
   const [isPaperImporting, setIsPaperImporting] = useState(false);
   const [isPaperAssistantLoading, setIsPaperAssistantLoading] = useState(false);
+  const [isPaperReportRegenerating, setIsPaperReportRegenerating] = useState(false);
   const [compileDiagnosis, setCompileDiagnosis] = useState<AssistantDiagnosis | null>(null);
   const [projectMembers, setProjectMembers] = useState<ProjectMember[]>([]);
   const [projectInvitations, setProjectInvitations] = useState<ProjectInvitation[]>([]);
@@ -728,6 +843,12 @@ export default function App() {
   }, [appView]);
 
   useEffect(() => {
+    if (appView !== "user-space") {
+      setLastPrimaryAppView(appView);
+    }
+  }, [appView]);
+
+  useEffect(() => {
     if (!sessionUser) {
       setTemplateCatalog([]);
       setSelectedTemplateId(null);
@@ -742,13 +863,15 @@ export default function App() {
 
       setStatusText(error instanceof Error ? error.message : "加载模板目录失败");
     });
-  }, [sessionUser, templateCategory, templateQuery, templateSourceType]);
+  }, [sessionUser]);
 
   useEffect(() => {
     if (!selectedTemplateId || !sessionUser) {
       setSelectedTemplate(null);
       return;
     }
+
+    setSelectedTemplate((current) => (current?.id === selectedTemplateId ? current : null));
 
     void loadTemplateDetail(selectedTemplateId).catch((error) => {
       if (handleUnauthorizedError(error)) {
@@ -758,6 +881,30 @@ export default function App() {
       setStatusText(error instanceof Error ? error.message : "加载模板详情失败");
     });
   }, [selectedTemplateId, sessionUser]);
+
+  useEffect(() => {
+    if (!activeProjectId || !activePaper || appView !== "paper-reader") {
+      return undefined;
+    }
+
+    const currentStatus = activePaperReportState?.status;
+    if (currentStatus !== "queued" && currentStatus !== "running") {
+      return undefined;
+    }
+
+    const timer = window.setInterval(() => {
+      void refreshPaperReportForReader(activeProjectId, activePaper.paperId).catch((error) => {
+        if (handleUnauthorizedError(error)) {
+          return;
+        }
+        setStatusText(error instanceof Error ? error.message : "刷新论文报告状态失败");
+      });
+    }, 2600);
+
+    return () => {
+      window.clearInterval(timer);
+    };
+  }, [activePaper, activePaperReportState?.status, activeProjectId, appView]);
 
   useEffect(() => {
     if (!isGlobalSearchOpen) {
@@ -825,6 +972,7 @@ export default function App() {
       setSnapshots([]);
       setProjectPaperLibrary([]);
       setPaperSearchResults([]);
+      setPaperSearchSourceStatuses([]);
       setActivePaper(null);
       setActivePaperHighlights([]);
       setPaperAssistantReply(null);
@@ -910,15 +1058,18 @@ export default function App() {
         setActiveProjectId(firstProject?.id ?? null);
         setActiveProjectName(firstProject?.name ?? "未选择项目");
         resetAssistantConversation(firstProject?.name ?? "未选择项目");
-        setAppView((current) => (current === "explore" ? "explore" : "workspace"));
+        setAppView((current) =>
+          current === "templates" || current === "search" || current === "user-space" ? current : "workspace",
+        );
       } else {
         setActiveProjectId(null);
         setActiveProjectName("未选择项目");
         setActiveFileId(null);
         setActiveFilePath(null);
         resetAssistantConversation("未选择项目");
-        setAppView("explore");
+        setAppView((current) => (current === "user-space" ? current : "templates"));
       }
+      setStatusText("同步完成");
     } catch (error) {
       if (handleUnauthorizedError(error)) {
         return;
@@ -942,14 +1093,11 @@ export default function App() {
     setIsTemplateCatalogLoading(true);
 
     try {
-      const payload = await listTemplates({
-        query: templateQuery,
-        category: templateCategory,
-        sourceType: templateSourceType,
-      });
-      const nextTemplateId = payload.templates.some((template) => template.id === selectedTemplateId)
-        ? selectedTemplateId
-        : payload.templates[0]?.id ?? null;
+      const payload = await listTemplates();
+      const nextTemplateId =
+        selectedTemplateId && payload.templates.some((template) => template.id === selectedTemplateId)
+          ? selectedTemplateId
+          : null;
       setTemplateCatalog(payload.templates);
       setSelectedTemplateId(nextTemplateId);
       setSelectedTemplate((detail) => (detail?.id === nextTemplateId ? detail : null));
@@ -1039,7 +1187,20 @@ export default function App() {
     return true;
   }
 
-  async function refreshProjects(nextActiveProjectId?: string | null) {
+  function handleOpenUserSpace() {
+    if (appView !== "user-space") {
+      setLastPrimaryAppView(appView);
+    }
+
+    setAppView("user-space");
+    setStatusText("已打开用户空间");
+  }
+
+  function handleReturnFromUserSpace() {
+    setAppView(lastPrimaryAppView ?? "workspace");
+  }
+
+  async function refreshProjects(nextActiveProjectId?: string | null, options: { preserveAppView?: boolean } = {}) {
     const [workspacePayload, payload] = await Promise.all([getWorkspaces(), listProjects()]);
     setSessionUser(decorateSessionUser(payload.user));
     setPersonalWorkspace(workspacePayload.personal);
@@ -1058,6 +1219,7 @@ export default function App() {
       setEditorValue("");
       setProjectPaperLibrary([]);
       setPaperSearchResults([]);
+      setPaperSearchSourceStatuses([]);
       setActivePaper(null);
       setActivePaperHighlights([]);
       setPaperAssistantReply(null);
@@ -1071,13 +1233,17 @@ export default function App() {
       setCollaborators([]);
       setCollaborationStatus("disconnected");
       resetAssistantConversation("未选择项目");
-      setAppView("explore");
+      if (!options.preserveAppView) {
+        setAppView("templates");
+      }
       return;
     }
 
     setActiveProjectId(targetProject.id);
     setActiveProjectName(targetProject.name);
-    setAppView("workspace");
+    if (!options.preserveAppView) {
+      setAppView("workspace");
+    }
     if (targetProject.workspaceType === "personal" && personalWorkspace) {
       setSelectedWorkspaceKey(getWorkspaceKey(personalWorkspace));
     } else if (targetProject.workspaceType === "organization" && targetProject.organizationId) {
@@ -1134,6 +1300,35 @@ export default function App() {
     );
   }
 
+  async function loadUserSpaceProjectContext(projectId: string): Promise<UserSpaceProjectContext> {
+    if (!projects.some((project) => project.id === projectId)) {
+      throw new Error("目标项目不存在或当前不可访问");
+    }
+
+    if (
+      projectId === activeProjectId &&
+      (projectMembers.length > 0 || auditLogs.length > 0 || versionEvents.length > 0)
+    ) {
+      return {
+        members: projectMembers,
+        auditLogs,
+        versionEvents,
+      };
+    }
+
+    const [memberPayload, auditPayload, versionPayload] = await Promise.all([
+      listProjectMembers(projectId),
+      listProjectAuditLogs(projectId),
+      listProjectVersionEvents(projectId),
+    ]);
+
+    return {
+      members: memberPayload.members,
+      auditLogs: auditPayload.logs,
+      versionEvents: versionPayload.events,
+    };
+  }
+
   async function ensurePaperImportedForProject(paperId: string) {
     if (!activeProjectId) {
       throw new Error("请先选择项目");
@@ -1151,6 +1346,26 @@ export default function App() {
     });
     await refreshProjectResources(activeProjectId);
     return payload.paper;
+  }
+
+  async function ensurePaperReportForReader(projectId: string, paperId: string) {
+    const payload = await ensureProjectPaperReport(projectId, paperId);
+    setActivePaperReport(payload.report);
+    setActivePaperReportState(payload.state);
+    return payload;
+  }
+
+  async function refreshPaperReportForReader(projectId: string, paperId: string) {
+    const payload = await getProjectPaperReport(projectId, paperId);
+    setActivePaperReport(payload.report);
+    setActivePaperReportState(payload.state);
+    return payload;
+  }
+
+  async function refreshPaperNotesForReader(projectId: string, paperId: string) {
+    const payload = await listProjectPaperNotes(projectId, paperId);
+    setActivePaperNotes(payload.notes);
+    return payload;
   }
 
   async function appendProjectNoteFile(projectId: string, filePath: string, content: string) {
@@ -1190,8 +1405,12 @@ export default function App() {
     setEditorValue("");
     setProjectPaperLibrary([]);
     setPaperSearchResults([]);
+    setPaperSearchSourceStatuses([]);
     setActivePaper(null);
     setActivePaperHighlights([]);
+    setActivePaperReport(null);
+    setActivePaperReportState(null);
+    setActivePaperNotes([]);
     setPaperAssistantReply(null);
     setProjectMembers([]);
     setProjectInvitations([]);
@@ -1403,49 +1622,63 @@ export default function App() {
     setStatusText("团队成员已添加");
   }
 
-  async function handleRenameProject() {
-    if (!activeProjectId || !activeProject) {
+  async function handleRenameProject(
+    targetProject: ProjectSummary | null = activeProject,
+    options: { preserveAppView?: boolean } = {},
+  ) {
+    if (!targetProject) {
       window.alert("请先选择项目");
       return;
     }
 
-    const name = window.prompt("请输入新的项目名", activeProject.name);
+    const name = window.prompt("请输入新的项目名", targetProject.name);
 
-    if (!name) {
+    if (!name?.trim()) {
       return;
     }
 
-    await renameProject(activeProjectId, name);
-    await refreshProjects(activeProjectId);
-    setActiveProjectName(name);
-    resetAssistantConversation(name);
+    await renameProject(targetProject.id, name.trim());
+    await refreshProjects(activeProjectId ?? targetProject.id, {
+      ...(options.preserveAppView !== undefined ? { preserveAppView: options.preserveAppView } : {}),
+    });
     setStatusText("项目已重命名");
   }
 
-  async function handleDeleteProject() {
-    if (!activeProjectId || !activeProject) {
+  async function handleDeleteProject(
+    targetProject: ProjectSummary | null = activeProject,
+    options: { preserveAppView?: boolean } = {},
+  ) {
+    if (!targetProject) {
       window.alert("请先选择项目");
       return;
     }
 
-    if (!window.confirm(`确定删除项目「${activeProject.name}」吗？`)) {
+    if (!window.confirm(`确定删除项目「${targetProject.name}」吗？`)) {
       return;
     }
 
-    await deleteProject(activeProjectId);
-    stopCompilePolling();
-    await refreshProjects(null);
-    setProjectMembers([]);
-    setProjectInvitations([]);
-    setProjectComments([]);
-    setAuditLogs([]);
-    setVersionEvents([]);
-    setCompileSettings(null);
-    setCompileSettingsDraft(null);
-    setCompileLog("尚未触发编译");
-    setActiveCompileJob(null);
-    setPdfPreviewUrl(null);
-    setCompileDiagnosis(null);
+    const deletingActiveProject = targetProject.id === activeProjectId;
+
+    await deleteProject(targetProject.id);
+
+    if (deletingActiveProject) {
+      stopCompilePolling();
+      setProjectMembers([]);
+      setProjectInvitations([]);
+      setProjectComments([]);
+      setAuditLogs([]);
+      setVersionEvents([]);
+      setCompileSettings(null);
+      setCompileSettingsDraft(null);
+      setCompileLog("尚未触发编译");
+      setActiveCompileJob(null);
+      setPdfPreviewUrl(null);
+      setCompileDiagnosis(null);
+    }
+
+    await refreshProjects(deletingActiveProject ? null : activeProjectId, {
+      ...(options.preserveAppView !== undefined ? { preserveAppView: options.preserveAppView } : {}),
+    });
     setStatusText("项目已删除");
   }
 
@@ -1568,6 +1801,9 @@ export default function App() {
       setPdfPreviewUrl(
         payload.job.pdfUrl ? appendCurrentUserQuery(`${payload.job.pdfUrl}?v=${payload.job.updatedAt}`) : null,
       );
+      if (payload.job.pdfUrl) {
+        setRightTab("pdf");
+      }
       setCompileDiagnosis(null);
       await refreshProjectResources(payload.job.projectId);
       return;
@@ -1629,11 +1865,12 @@ export default function App() {
     setActiveFileId(null);
     setActiveFilePath(null);
     setEditorValue("");
-      setProjectPaperLibrary([]);
-      setPaperSearchResults([]);
-      setActivePaper(null);
-      setActivePaperHighlights([]);
-      setPaperAssistantReply(null);
+    setProjectPaperLibrary([]);
+    setPaperSearchResults([]);
+    setPaperSearchSourceStatuses([]);
+    setActivePaper(null);
+    setActivePaperHighlights([]);
+    setPaperAssistantReply(null);
     setProjectMembers([]);
     setProjectInvitations([]);
     setProjectComments([]);
@@ -1741,7 +1978,7 @@ export default function App() {
     }
   }
 
-  async function handleSearchProjectPapers(query: string) {
+  async function handleSearchProjectPapers(query: string, sources: string[] = defaultPaperSources) {
     if (!activeProjectId) {
       window.alert("请先选择项目");
       return;
@@ -1760,13 +1997,19 @@ export default function App() {
     try {
       const payload = await searchProjectPapers(activeProjectId, {
         query: normalizedQuery,
-        limit: 6,
-        sources: ["arxiv", "semantic_scholar", "pubmed"],
+        limit: defaultPaperSearchLimit,
+        sources,
       });
       setPaperSearchResults(payload.results);
+      setPaperSearchSourceStatuses(payload.sourceStatuses ?? []);
       setPaperAssistantReply(null);
-      setRightTab("paper-search");
-      setStatusText(`已返回 ${payload.results.length} 篇候选论文`);
+      setAppView("search");
+      const degradedCount = (payload.sourceStatuses ?? []).filter((status) => !status.ok).length;
+      setStatusText(
+        degradedCount > 0
+          ? `已返回 ${payload.results.length} 篇候选论文，${degradedCount} 个来源本次已降级`
+          : `已返回 ${payload.results.length} 篇候选论文`,
+      );
     } finally {
       setIsPaperSearching(false);
     }
@@ -1780,17 +2023,26 @@ export default function App() {
 
     setIsPaperLoading(true);
     setStatusText("正在加载论文内容...");
+    setActivePaperReport(null);
+    setActivePaperReportState(null);
+    setActivePaperNotes([]);
 
     try {
-      const [payload, highlightsPayload] = await Promise.all([
-        getProjectPaper(activeProjectId, paperId, 18000),
-        listProjectPaperHighlights(activeProjectId, paperId),
+      const payload = await getProjectPaper(activeProjectId, paperId, 18000);
+      const [highlightsPayload] = await Promise.all([
+        listProjectPaperHighlights(activeProjectId, payload.paper.paperId),
+        ensurePaperReportForReader(activeProjectId, payload.paper.paperId),
+        refreshPaperNotesForReader(activeProjectId, payload.paper.paperId),
       ]);
       setActivePaper(payload.paper);
       setActivePaperHighlights(highlightsPayload.highlights);
       setPaperAssistantReply(null);
-      setRightTab("paper-reader");
+      setAppView("paper-reader");
       setStatusText("论文内容已加载");
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "论文内容获取失败";
+      window.alert(message);
+      setStatusText(message);
     } finally {
       setIsPaperLoading(false);
     }
@@ -1816,13 +2068,13 @@ export default function App() {
   async function handleAskPaperAssistant(message: string, selectedPaperIds: string[] = []) {
     if (!activeProjectId) {
       window.alert("请先选择项目");
-      return;
+      return null;
     }
 
     const normalizedMessage = message.trim();
 
     if (!normalizedMessage) {
-      return;
+      return null;
     }
 
     setIsPaperAssistantLoading(true);
@@ -1832,14 +2084,62 @@ export default function App() {
       const payload = await askProjectPaperAssistant(activeProjectId, {
         message: normalizedMessage,
         selectedPaperIds,
-        sources: ["arxiv", "semantic_scholar", "pubmed"],
+        sources: defaultPaperAssistantSources,
       });
       setPaperAssistantReply(payload.reply);
       setStatusText(
         payload.reply.source === "local_fallback" ? "研究助手返回了本地兜底提示" : "研究助手已生成回复",
       );
+      return payload.reply;
     } finally {
       setIsPaperAssistantLoading(false);
+    }
+  }
+
+  async function handleAskSelectionPaperAssistant(selectionText: string, followUp?: string) {
+    if (!activePaper) {
+      return null;
+    }
+
+    const prompt = followUp?.trim()
+      ? [
+          `请继续基于当前论文《${activePaper.title}》和下面这段原文回答追问。`,
+          "",
+          `原文片段：${selectionText}`,
+          "",
+          `追问：${followUp.trim()}`,
+        ].join("\n")
+      : [
+          `请解释当前论文《${activePaper.title}》中的下面这段内容，说明它在论文方法、实验或论证中的作用。`,
+          "",
+          `原文片段：${selectionText}`,
+        ].join("\n");
+
+    return handleAskPaperAssistant(prompt, [activePaper.paperId]);
+  }
+
+  async function handleAskActivePaperAssistant(message: string) {
+    if (!activePaper) {
+      return null;
+    }
+    return handleAskPaperAssistant(message, [activePaper.paperId]);
+  }
+
+  async function handleRegenerateActivePaperReport() {
+    if (!activeProjectId || !activePaper) {
+      window.alert("请先打开一篇论文");
+      return;
+    }
+
+    setIsPaperReportRegenerating(true);
+    setStatusText("正在重算论文报告...");
+    try {
+      const payload = await regenerateProjectPaperReport(activeProjectId, activePaper.paperId);
+      setActivePaperReport(payload.report);
+      setActivePaperReportState(payload.state);
+      setStatusText("论文报告已进入重算队列");
+    } finally {
+      setIsPaperReportRegenerating(false);
     }
   }
 
@@ -1902,7 +2202,56 @@ export default function App() {
     setStatusText(`已将阅读笔记写入 ${noteFilePath}`);
   }
 
+  async function handleCreatePaperNote(payload: {
+    title: string;
+    text: string;
+    anchorId?: string | null;
+    pageNumber?: number | null;
+    contextText?: string | null;
+  }) {
+    if (!activeProjectId || !activePaper) {
+      return;
+    }
+    const response = await createProjectPaperNote(activeProjectId, activePaper.paperId, payload);
+    setActivePaperNotes((current) => [response.note, ...current]);
+    setStatusText("论文笔记已保存");
+  }
+
+  async function handleUpdatePaperNote(
+    note: PaperNote,
+    patch: {
+      title?: string;
+      text?: string;
+      anchorId?: string | null;
+      pageNumber?: number | null;
+      contextText?: string | null;
+    },
+  ) {
+    if (!activeProjectId || !activePaper) {
+      return;
+    }
+    const response = await updateProjectPaperNote(activeProjectId, activePaper.paperId, note.id, patch);
+    setActivePaperNotes((current) =>
+      current.map((item) => (item.id === note.id ? response.note : item)),
+    );
+    setStatusText("论文笔记已更新");
+  }
+
+  async function handleDeletePaperNote(note: PaperNote) {
+    if (!activeProjectId || !activePaper) {
+      return;
+    }
+    const confirmed = window.confirm("确定要删除这条论文笔记吗？");
+    if (!confirmed) {
+      return;
+    }
+    await deleteProjectPaperNote(activeProjectId, activePaper.paperId, note.id);
+    setActivePaperNotes((current) => current.filter((item) => item.id !== note.id));
+    setStatusText("论文笔记已删除");
+  }
+
   async function handleCreatePaperHighlight(payload: {
+    kind: "highlight" | "comment";
     content: { text: string; image?: string };
     comment: { text: string; emoji: string };
     position: {
@@ -1918,7 +2267,7 @@ export default function App() {
 
     const response = await createProjectPaperHighlight(activeProjectId, activePaper.paperId, payload);
     setActivePaperHighlights((current) => [...current, response.highlight]);
-    setStatusText("论文摘录已保存");
+    setStatusText(payload.kind === "comment" ? "论文评论已保存" : "论文高亮已保存");
   }
 
   async function handleInsertPaperHighlight(highlight: ProjectPaperHighlight) {
@@ -1961,12 +2310,15 @@ export default function App() {
     setStatusText("摘录备注已更新");
   }
 
-  async function handleDeletePaperHighlight(highlight: ProjectPaperHighlight) {
+  async function handleDeletePaperHighlight(
+    highlight: ProjectPaperHighlight,
+    options: { skipConfirm?: boolean } = {},
+  ) {
     if (!activeProjectId || !activePaper) {
       return;
     }
 
-    if (!window.confirm("确定删除这条论文摘录吗？")) {
+    if (!options.skipConfirm && !window.confirm("确定删除这条论文摘录吗？")) {
       return;
     }
 
@@ -2254,16 +2606,17 @@ export default function App() {
   async function handleRunGlobalCommand(commandId: string) {
     switch (commandId) {
       case "go-explore":
-        setAppView("explore");
-        setStatusText("已切换到探索页");
+      case "go-templates":
+        setAppView("templates");
+        setStatusText("已切换到模板库");
         return;
       case "create-project":
         await handleCreateProject();
         return;
       case "open-paper-search":
-        setAppView("workspace");
-        setRightTab("paper-search");
-        setStatusText("已打开论文检索面板");
+      case "open-search":
+        setAppView("search");
+        setStatusText("已打开论文搜索页");
         return;
       case "compile-project":
         if (!activeProjectId) {
@@ -2278,9 +2631,13 @@ export default function App() {
         setStatusText("已打开 AI 助手");
         return;
       case "open-paper-reader":
-        setAppView("workspace");
-        setRightTab("paper-reader");
-        setStatusText("已打开论文阅读面板");
+        if (!activePaper) {
+          setAppView("search");
+          setStatusText("请先从论文搜索页打开一篇论文");
+          return;
+        }
+        setAppView("paper-reader");
+        setStatusText("已打开论文阅读页");
         return;
       default:
         setStatusText("当前命令暂未实现");
@@ -2331,13 +2688,12 @@ export default function App() {
         await handleSelectProject(targetProject);
       }
 
-      setAppView("workspace");
       await handleOpenPaper(item.paperId);
       return;
     }
 
     if (item.type === "template" && item.templateId) {
-      setAppView("explore");
+      setAppView("templates");
       setSelectedTemplateId(item.templateId);
       setStatusText(`已定位到模板：${item.title}`);
       return;
@@ -2351,7 +2707,7 @@ export default function App() {
   async function handleLogout() {
     await logoutCurrentSession();
     stopCompilePolling();
-    setAppView("explore");
+    setAppView("templates");
     setSessionUser(null);
     setPersonalWorkspace(null);
     setOrganizationWorkspaces([]);
@@ -2409,10 +2765,17 @@ export default function App() {
           <nav className="top-nav">
             <button
               type="button"
-              className={`top-nav-item${appView === "explore" ? " top-nav-item-active" : ""}`}
-              onClick={() => setAppView("explore")}
+              className={`top-nav-item${appView === "templates" ? " top-nav-item-active" : ""}`}
+              onClick={() => setAppView("templates")}
             >
-              探索
+              模板库
+            </button>
+            <button
+              type="button"
+              className={`top-nav-item${appView === "search" ? " top-nav-item-active" : ""}`}
+              onClick={() => setAppView("search")}
+            >
+              搜索
             </button>
             <button
               type="button"
@@ -2421,6 +2784,15 @@ export default function App() {
             >
               写作工作台
             </button>
+            {activePaper || appView === "paper-reader" ? (
+              <button
+                type="button"
+                className={`top-nav-item${appView === "paper-reader" ? " top-nav-item-active" : ""}`}
+                onClick={() => setAppView("paper-reader")}
+              >
+                论文阅读
+              </button>
+            ) : null}
           </nav>
         </div>
 
@@ -2451,10 +2823,14 @@ export default function App() {
         </div>
 
         <div className="topbar-right">
-          <div className="user-chip">
+          <button
+            type="button"
+            className={`user-chip${appView === "user-space" ? " user-chip-active" : ""}`}
+            onClick={handleOpenUserSpace}
+          >
             <strong>{sessionUser.name}</strong>
             <small>{sessionUser.email ?? "已登录用户"}</small>
-          </div>
+          </button>
           <div className="collaborators">
             {visibleCollaborators.length === 0 ? (
               <span className="avatar avatar-amber">协作</span>
@@ -2474,38 +2850,98 @@ export default function App() {
           <button type="button" className="ghost-button" onClick={() => void handleAcceptInvitation()}>
             加入项目
           </button>
-          <button type="button" className="accent-button" onClick={() => void handleCreateProject()}>
-            新建项目
-          </button>
-          <button type="button" className="icon-button" title="重命名项目" onClick={() => void handleRenameProject()}>
-            ✎
-          </button>
-          <button type="button" className="icon-button" title="删除项目" onClick={() => void handleDeleteProject()}>
-            ⌫
-          </button>
           <button type="button" className="ghost-button" onClick={() => void handleLogout()}>
             退出
           </button>
         </div>
       </header>
 
-      {appView === "explore" ? (
+      {appView === "templates" ? (
         <ExplorePage
           activeWorkspace={activeWorkspace ?? null}
           templates={templateCatalog}
           selectedTemplateId={selectedTemplateId}
           selectedTemplate={selectedTemplate}
           query={templateQuery}
-          category={templateCategory}
           sourceType={templateSourceType}
           isLoading={isTemplateCatalogLoading}
           isCreating={isTemplateCreating}
           onQueryChange={setTemplateQuery}
-          onCategoryChange={setTemplateCategory}
           onSourceTypeChange={setTemplateSourceType}
           onSelectTemplate={setSelectedTemplateId}
           onCreateFromTemplate={(template) => void handleCreateProjectFromTemplate(template)}
         />
+      ) : appView === "search" ? (
+        <PaperSearchPage
+          activeProjectName={activeProjectName}
+          hasActiveProject={!!activeProjectId}
+          results={paperSearchResults}
+          sourceStatuses={paperSearchSourceStatuses}
+          importedPapers={projectPaperLibrary}
+          activePaper={activePaper}
+          isSearching={isPaperSearching}
+          onSearch={handleSearchProjectPapers}
+          onOpenPaper={handleOpenPaper}
+          onImportPaper={handleImportPaper}
+          onResumeReading={() => setAppView("paper-reader")}
+        />
+      ) : appView === "user-space" ? (
+        <UserSpacePage
+          sessionUser={sessionUser}
+          projects={projects}
+          allWorkspaces={allWorkspaces}
+          organizationWorkspaces={organizationWorkspaces}
+          teamWorkspaces={teamWorkspaces}
+          onBack={handleReturnFromUserSpace}
+          onCreateProject={() => void handleCreateProject()}
+          onOpenTemplates={() => setAppView("templates")}
+          onOpenProject={(project) => void handleSelectProject(project)}
+          onRenameProject={(project) => void handleRenameProject(project, { preserveAppView: true })}
+          onDeleteProject={(project) => void handleDeleteProject(project, { preserveAppView: true })}
+          onLoadProjectContext={loadUserSpaceProjectContext}
+        />
+      ) : appView === "paper-reader" ? (
+        <main className="min-h-[calc(100vh-64px)]">
+          {activePaper ? (
+            <Suspense fallback={<div className="empty-panel">论文阅读器加载中...</div>}>
+              <PaperReaderPanel
+                paper={activePaper}
+                importedPaper={activeImportedPaper}
+                pdfUrl={
+                  activeProjectId && activePaper && activePaper.pdfUrl
+                    ? appendCurrentUserQuery(
+                        `/api/projects/${activeProjectId}/papers/${encodeURIComponent(activePaper.paperId)}/pdf`,
+                      )
+                    : null
+                }
+                isLoading={isPaperLoading}
+                isImporting={isPaperImporting}
+                assistantReply={paperAssistantReply}
+                report={activePaperReport}
+                reportState={activePaperReportState}
+                notes={activePaperNotes}
+                isAskingAssistant={isPaperAssistantLoading || isPaperReportRegenerating}
+                highlights={activePaperHighlights}
+                onBackToSearch={() => setAppView("search")}
+                onBackToWorkspace={() => setAppView("workspace")}
+                onImportPaper={handleImportPaper}
+                onAskAssistant={handleAskActivePaperAssistant}
+                onAskSelectionAssistant={handleAskSelectionPaperAssistant}
+                onRegenerateReport={handleRegenerateActivePaperReport}
+                onInsertCitation={handleInsertPaperCitation}
+                onInsertSummary={handleInsertPaperSummary}
+                onSaveReadingNote={handleSavePaperReadingNote}
+                onCreateNote={handleCreatePaperNote}
+                onUpdateNote={handleUpdatePaperNote}
+                onDeleteNote={handleDeletePaperNote}
+                onCreateHighlight={handleCreatePaperHighlight}
+                onDeleteHighlight={(highlight, options) => handleDeletePaperHighlight(highlight, options)}
+              />
+            </Suspense>
+          ) : (
+            <div className="empty-panel">先从“搜索”页打开一篇论文，再进入阅读视图。</div>
+          )}
+        </main>
       ) : (
       <main className="workspace-shell">
         <aside className="left-sidebar">
@@ -2665,37 +3101,7 @@ export default function App() {
           </div>
         </section>
 
-        <aside className="right-panel">
-          <div className="right-tabs">
-            <RightTabButton value="pdf" active={rightTab === "pdf"} onClick={setRightTab}>
-              PDF 预览
-            </RightTabButton>
-            <RightTabButton value="assistant" active={rightTab === "assistant"} onClick={setRightTab}>
-              AI 助手
-            </RightTabButton>
-            <RightTabButton value="paper-search" active={rightTab === "paper-search"} onClick={setRightTab}>
-              检索论文
-            </RightTabButton>
-            <RightTabButton value="paper-reader" active={rightTab === "paper-reader"} onClick={setRightTab}>
-              论文阅读
-            </RightTabButton>
-            <RightTabButton value="snapshots" active={rightTab === "snapshots"} onClick={setRightTab}>
-              快照历史
-            </RightTabButton>
-            <RightTabButton value="logs" active={rightTab === "logs"} onClick={setRightTab}>
-              编译日志
-            </RightTabButton>
-            <RightTabButton value="comments" active={rightTab === "comments"} onClick={setRightTab}>
-              评论批注
-            </RightTabButton>
-            <RightTabButton value="members" active={rightTab === "members"} onClick={setRightTab}>
-              成员邀请
-            </RightTabButton>
-            <RightTabButton value="audit" active={rightTab === "audit"} onClick={setRightTab}>
-              审计回放
-            </RightTabButton>
-          </div>
-
+        <div className="right-panel-content">
           <section className={`tab-panel${rightTab === "pdf" ? " tab-panel-active" : ""}`}>
             <div className="panel-toolbar">
               <span>编译结果预览</span>
@@ -2789,56 +3195,6 @@ export default function App() {
                 </div>
               </div>
             </div>
-          </section>
-
-          <section className={`tab-panel${rightTab === "paper-search" ? " tab-panel-active" : ""}`}>
-            <div className="panel-toolbar">
-              <span>论文检索与文献库</span>
-            </div>
-            <PaperSearchPanel
-              papers={projectPaperLibrary}
-              results={paperSearchResults}
-              isSearching={isPaperSearching}
-              isAskingAssistant={isPaperAssistantLoading}
-              assistantReply={paperAssistantReply}
-              onSearch={handleSearchProjectPapers}
-              onOpenPaper={handleOpenPaper}
-              onImportPaper={handleImportPaper}
-              onAskAssistant={(message) => handleAskPaperAssistant(message)}
-            />
-          </section>
-
-          <section className={`tab-panel${rightTab === "paper-reader" ? " tab-panel-active" : ""}`}>
-            <div className="panel-toolbar">
-              <span>论文 PDF 阅读</span>
-            </div>
-            <Suspense fallback={<div className="empty-panel">论文阅读器加载中...</div>}>
-              <PaperReaderPanel
-                paper={activePaper}
-                importedPaper={activeImportedPaper}
-                pdfUrl={
-                  activeProjectId && activePaper && activePaper.pdfUrl
-                    ? appendCurrentUserQuery(
-                        `/api/projects/${activeProjectId}/papers/${encodeURIComponent(activePaper.paperId)}/pdf`,
-                      )
-                    : null
-                }
-                isLoading={isPaperLoading}
-                isImporting={isPaperImporting}
-                isAskingAssistant={isPaperAssistantLoading}
-                assistantReply={paperAssistantReply}
-                highlights={activePaperHighlights}
-                onImportPaper={handleImportPaper}
-                onAskAssistant={handleAskPaperAssistant}
-                onInsertCitation={handleInsertPaperCitation}
-                onInsertSummary={handleInsertPaperSummary}
-                onSaveReadingNote={handleSavePaperReadingNote}
-                onCreateHighlight={handleCreatePaperHighlight}
-                onInsertHighlight={handleInsertPaperHighlight}
-                onEditHighlight={handleEditPaperHighlight}
-                onDeleteHighlight={handleDeletePaperHighlight}
-              />
-            </Suspense>
           </section>
 
           <section className={`tab-panel${rightTab === "snapshots" ? " tab-panel-active" : ""}`}>
@@ -3048,11 +3404,7 @@ export default function App() {
                   </small>
                   {comment.excerpt ? <pre className="compile-log">{comment.excerpt}</pre> : null}
                   <div className="assistant-code-actions">
-                    <button
-                      type="button"
-                      className="mini-button"
-                      onClick={() => handleJumpToLine(comment.lineStart)}
-                    >
+                    <button type="button" className="mini-button" onClick={() => handleJumpToLine(comment.lineStart)}>
                       跳转定位
                     </button>
                     <button
@@ -3079,9 +3431,7 @@ export default function App() {
                       ))}
                     </div>
                   ) : null}
-                  {comment.resolvedAt ? (
-                    <small>已于 {formatDate(comment.resolvedAt)} 标记为已解决</small>
-                  ) : null}
+                  {comment.resolvedAt ? <small>已于 {formatDate(comment.resolvedAt)} 标记为已解决</small> : null}
                 </div>
               ))}
             </div>
@@ -3198,9 +3548,7 @@ export default function App() {
                       >
                         <div>
                           <strong>{member.displayName}</strong>
-                          <small>
-                            {member.email} · {formatWorkspaceRoleLabel(member.role)}
-                          </small>
+                          <small>{member.email} · {formatWorkspaceRoleLabel(member.role)}</small>
                         </div>
                       </div>
                     ))}
@@ -3269,7 +3617,20 @@ export default function App() {
               ) : null}
             </div>
           </section>
+        </div>
 
+        <aside className="right-rail" aria-label="右侧功能导航">
+          <div className="right-tabs">
+            {rightTabDefinitions.map((tab) => (
+              <RightTabButton
+                key={tab.value}
+                value={tab.value}
+                label={tab.label}
+                active={rightTab === tab.value}
+                onClick={setRightTab}
+              />
+            ))}
+          </div>
           <div className="right-footer">
             <span>{sessionUser.name}</span>
             <div className="sync-indicator" />
@@ -3286,7 +3647,16 @@ export default function App() {
  * - 当前主界面按工作台职责集中组织状态，但接口访问和编辑器实现已分别抽离，避免 `App` 退化成无边界的巨型文件。
  * - 协作配置仍由 `App` 统一组装，但房间协议、编辑器绑定和持久化都已下沉到专门模块，避免协作逻辑散落在页面各处。
  * - 工作空间、组织和团队入口已接入同一工作台，而不是另起页面，保持 Overleaf 类产品的单工作区心智模型。
+ * - 模板库页面现在一次拉全量模板目录，再由前端按搜索词、来源和分类本地重排，避免把“分类导航”绑死在接口过滤上。
  * - AI 面板已升级为“持久化对话 + 解释/优化/修复动作”工作区，但 inline completion 仍应作为独立模块继续实现。
  * - 编译前显式保存当前文本文件，优先保证协作输入和编译输出之间的一致性，而不是依赖异步持久化时序碰运气。
+ * - 编译进行中停留在日志面板有助于观察队列状态，但成功后应优先回到 PDF 预览，保证用户首先看到主结果而不是技术日志。
+ * - 论文阅读已从右侧工作台面板中拆出，改成独立页面视图，避免把重内容阅读器继续塞进工具侧栏。
+ * - 论文搜索已提升为顶栏一级页面，不再复用工作台右侧窄面板，以免检索、阅读和写作三种任务继续挤在同一条侧栏里。
+ * - 打开 discovery 源论文时，会先解析到可读源后再加载高亮；高亮查询不再错误地继续使用原始 `openalex` 纸面 ID。
+ * - 打开论文失败时现在显式弹出后端错误，并把状态栏同步成真实错误文案，像“未找到可读来源”这类 discovery 失败语义不会再被吞成笼统提示。
+ * - 论文搜索默认 limit 回收到 200，优先保证交互响应；如需大规模召回仍可通过接口显式传更高 limit（上限 500）。
+ * - 右侧图标侧栏已提升为页面级最右一列，避免继续被右侧内容面板包裹后产生“靠不住边”和中宽屏错位问题。
+ * - 工作台在窄宽度下改为单列重排，而不是整体缩放；这能保住编辑器和 PDF 工具的可读性与点击面积。
  * - 若后续继续扩展，应优先把左侧资源区、右侧面板和顶部栏拆成子组件，而不是直接继续堆叠到当前文件。
  */

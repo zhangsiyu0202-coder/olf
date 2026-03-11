@@ -59,7 +59,6 @@ services:
       AI_API_KEY: ${AI_API_KEY:-}
       AI_BASE_URL: ${AI_BASE_URL:-https://api.deepseek.com/v1}
       AI_MODEL_NAME: ${AI_MODEL_NAME:-deepseek-chat}
-      SEMANTIC_SCHOLAR_API_KEY: ${SEMANTIC_SCHOLAR_API_KEY:-}
       PAPER_SOURCE_TIMEOUT_MS: ${PAPER_SOURCE_TIMEOUT_MS:-15000}
       PAPER_SERVICE_CACHE_ROOT: /app/.runtime/paper-service-cache
     ports:

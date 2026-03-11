@@ -39,7 +39,7 @@
 - 协作编辑：`Yjs + WebSocket + CodeMirror 6`、在线状态、协作文档持久化
 - 项目成员与邀请：本地演示用户会话、成员列表、邀请链接加入、项目访问过滤
 - 编译体验增强：项目级主文件/引擎设置、任务配置快照、结构化诊断与日志跳转
-- 论文模块：以“多源聚合检索 + 分层全文获取”为目标，当前已接入 `arXiv / Semantic Scholar / PubMed` 搜索，并打通项目文献库、`refs.bib` 导入、PDF 阅读与研究 Agent
+- 论文模块：以“多源聚合检索 + 分层全文获取”为目标，当前已接入 `arXiv / PubMed / OpenAlex` 搜索，并打通项目文献库、`refs.bib` 导入、PDF 阅读与研究 Agent
 - 论文服务拆分：主站已支持通过 `PAPER_ASSISTANT_BASE_URL` 对接独立论文搜索服务
 - 轻回流：插入 `\cite{}`、插入论文总结、保存阅读笔记到项目文件
 - PDF 摘录：高亮选区、项目级持久化、摘录列表回看与定位
@@ -171,20 +171,24 @@
 
 - 论文检索面板与项目文献库
 - 论文模块产品方向已收敛为“多源聚合检索 + 分层全文获取”
-- 当前已接入基于 LangChain `ArxivRetriever` 的 `arXiv` 搜索
+- 当前已接入基于原生 `arxiv` 包的 `arXiv` 搜索
 - 基于 LangChain `ArxivLoader` 的论文内容加载
+- 当前已接入 `PubMed / OpenAlex` 搜索，并返回来源级搜索状态
+- `OpenAlex` 阅读时会自动精确解析到 `arXiv / PubMed`，解析失败则保留 metadata-only 导入能力
 - 研究场景 Agent/Tool，仅在论文检索与阅读界面使用
 - 项目级 BibTeX 导入与 `refs.bib` 自动写入
 - 论文 PDF 本地缓存与前端阅读器
 - 论文 PDF 摘录与项目级持久化
 - 论文阅读结果轻回流到写作区
+- 论文阅读页右侧升级为 `Assistant + Notes` 双标签工作台
+- 论文报告异步生成链路：`ensure/get/regenerate`、`paper-report worker`、全局报告缓存
+- 结构化报告约束输出（章节完整性 + 证据锚点）与 `degraded` 降级语义
 
 后续方向：
 
-- 在 `packages/paper-assistant` 内继续接入 `Semantic Scholar`、`PubMed` 等来源，形成多源聚合搜索
 - 将独立论文搜索服务部署到香港等跨境访问更稳定的节点，主站通过 HTTP 调用
 - 区分“搜索发现源”和“全文获取源”，避免把元数据源误当成全文源
-- Crossref 元数据补全与更强去重
+- OpenAlex 显式标识补全与更强去重
 - 从阅读摘录直接生成引用与写作片段
 
 ### 3.10 探索页与模板入口

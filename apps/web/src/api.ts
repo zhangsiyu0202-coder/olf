@@ -16,7 +16,7 @@
  *   - ./types
  *
  * Last Updated:
- *   - 2026-03-08 by Codex - 升级论文接口为多源搜索能力
+ *   - 2026-03-11 by Codex - 新增论文报告与论文私有笔记接口封装，并增强非 JSON 错误响应兼容
  */
 
 import type {
@@ -27,6 +27,10 @@ import type {
   OrganizationSummary,
   PaperAssistantReply,
   PaperDetail,
+  PaperNote,
+  PaperReport,
+  PaperReportState,
+  PaperSearchResponse,
   ProjectTemplateDetail,
   ProjectTemplateSummary,
   ProjectPaperHighlight,
@@ -70,10 +74,24 @@ async function requestJson<T>(url: string, options: RequestInit = {}): Promise<T
     ...options,
   });
 
-  const payload = (await response.json()) as { error?: { message?: string } };
+  const responseText = await response.text();
+  let payload: ({ error?: { message?: string }; detail?: string } & Record<string, unknown>) | null = null;
+
+  if (responseText.trim()) {
+    try {
+      payload = JSON.parse(responseText) as { error?: { message?: string }; detail?: string } & Record<string, unknown>;
+    } catch {
+      payload = null;
+    }
+  }
 
   if (!response.ok) {
-    throw new ApiRequestError(payload.error?.message ?? "请求失败", response.status);
+    const fallbackMessage = responseText.trim() || `请求失败 (${response.status})`;
+    throw new ApiRequestError(payload?.error?.message ?? payload?.detail ?? fallbackMessage, response.status);
+  }
+
+  if (payload === null) {
+    throw new ApiRequestError("服务返回了非 JSON 响应", response.status);
   }
 
   return payload as T;
@@ -297,7 +315,7 @@ export function searchProjectPapers(
   projectId: string,
   payload: { query: string; limit?: number; sources?: string[] },
 ) {
-  return requestJson<{ results: PaperSearchResult[] }>(`/api/projects/${projectId}/papers/search`, {
+  return requestJson<PaperSearchResponse>(`/api/projects/${projectId}/papers/search`, {
     method: "POST",
     body: JSON.stringify(payload),
   });
@@ -346,6 +364,96 @@ export function askProjectPaperAssistant(
   });
 }
 
+export function ensureProjectPaperReport(
+  projectId: string,
+  paperId: string,
+  payload: { maxAttempts?: number } = {},
+) {
+  return requestJson<{ state: PaperReportState; report: PaperReport | null }>(
+    `/api/projects/${projectId}/papers/${encodeURIComponent(paperId)}/report/ensure`,
+    {
+      method: "POST",
+      body: JSON.stringify(payload),
+    },
+  );
+}
+
+export function getProjectPaperReport(projectId: string, paperId: string) {
+  return requestJson<{ state: PaperReportState; report: PaperReport | null }>(
+    `/api/projects/${projectId}/papers/${encodeURIComponent(paperId)}/report`,
+  );
+}
+
+export function regenerateProjectPaperReport(
+  projectId: string,
+  paperId: string,
+  payload: { maxAttempts?: number } = {},
+) {
+  return requestJson<{ state: PaperReportState; report: PaperReport | null }>(
+    `/api/projects/${projectId}/papers/${encodeURIComponent(paperId)}/report/regenerate`,
+    {
+      method: "POST",
+      body: JSON.stringify(payload),
+    },
+  );
+}
+
+export function listProjectPaperNotes(projectId: string, paperId: string) {
+  return requestJson<{ notes: PaperNote[] }>(
+    `/api/projects/${projectId}/papers/${encodeURIComponent(paperId)}/notes`,
+  );
+}
+
+export function createProjectPaperNote(
+  projectId: string,
+  paperId: string,
+  payload: {
+    title: string;
+    text: string;
+    anchorId?: string | null;
+    pageNumber?: number | null;
+    contextText?: string | null;
+  },
+) {
+  return requestJson<{ note: PaperNote }>(
+    `/api/projects/${projectId}/papers/${encodeURIComponent(paperId)}/notes`,
+    {
+      method: "POST",
+      body: JSON.stringify(payload),
+    },
+  );
+}
+
+export function updateProjectPaperNote(
+  projectId: string,
+  paperId: string,
+  noteId: string,
+  payload: {
+    title?: string;
+    text?: string;
+    anchorId?: string | null;
+    pageNumber?: number | null;
+    contextText?: string | null;
+  },
+) {
+  return requestJson<{ note: PaperNote }>(
+    `/api/projects/${projectId}/papers/${encodeURIComponent(paperId)}/notes/${encodeURIComponent(noteId)}`,
+    {
+      method: "PATCH",
+      body: JSON.stringify(payload),
+    },
+  );
+}
+
+export function deleteProjectPaperNote(projectId: string, paperId: string, noteId: string) {
+  return requestJson<{ note: PaperNote; success: boolean }>(
+    `/api/projects/${projectId}/papers/${encodeURIComponent(paperId)}/notes/${encodeURIComponent(noteId)}`,
+    {
+      method: "DELETE",
+    },
+  );
+}
+
 export function listProjectPaperHighlights(projectId: string, paperId: string) {
   return requestJson<{ highlights: ProjectPaperHighlight[] }>(
     `/api/projects/${projectId}/papers/${encodeURIComponent(paperId)}/highlights`,
@@ -356,6 +464,7 @@ export function createProjectPaperHighlight(
   projectId: string,
   paperId: string,
   payload: {
+    kind: "highlight" | "comment";
     content: { text: string; image?: string };
     comment: { text: string; emoji: string };
     position: {
@@ -380,6 +489,7 @@ export function updateProjectPaperHighlight(
   paperId: string,
   highlightId: string,
   payload: {
+    kind?: "highlight" | "comment";
     comment?: { text?: string; emoji?: string };
     content?: { text?: string; image?: string };
   },
@@ -740,5 +850,6 @@ export { ApiRequestError };
  * Code Review:
  * - 请求层只暴露业务动作，不把 `fetch` 细节扩散到视图层，符合低耦合要求。
  * - 当前仍采用轻量内联 DTO，而非引入完整生成式 SDK，避免为现阶段 API 规模过度设计。
+ * - 非 JSON 错误响应统一降级为可读文案，避免前端直接暴露 JSON 解析异常影响排障。
  * - 若后续接口显著增长，应把项目、编译、快照和 AI 拆成多个子客户端文件。
  */

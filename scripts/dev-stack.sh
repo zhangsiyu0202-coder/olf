@@ -20,6 +20,13 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${ROOT_DIR}"
 
+if [[ -f ".env" ]]; then
+  set -a
+  # shellcheck disable=SC1091
+  source .env
+  set +a
+fi
+
 API_PORT="${API_PORT:-3000}"
 WEB_PORT="${WEB_PORT:-5173}"
 WEB_HOST="${WEB_HOST:-127.0.0.1}"

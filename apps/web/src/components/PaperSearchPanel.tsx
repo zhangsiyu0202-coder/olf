@@ -11,7 +11,7 @@
  *   - ../types
  *
  * Last Updated:
- *   - 2026-03-08 by Codex - 升级为多源论文检索面板
+ *   - 2026-03-11 by Codex - 收缩为三源检索面板，并保留 OpenAlex 发现源
  */
 
 import { useState } from "react";
@@ -51,6 +51,9 @@ export default function PaperSearchPanel({
   const [query, setQuery] = useState("");
   const [assistantInput, setAssistantInput] = useState("");
   const importedPaperIds = new Set(papers.map((paper) => paper.paperId));
+  const importedPaperDois = new Set(
+    papers.map((paper) => String(paper.doi ?? "").trim().toLowerCase()).filter(Boolean),
+  );
 
   return (
     <div className="paper-panel-content">
@@ -72,7 +75,7 @@ export default function PaperSearchPanel({
             {isSearching ? "检索中..." : "检索论文"}
           </button>
         </div>
-        <small>当前结果会聚合多个论文源；来源标签、可读状态和导入动作都会明确显示，不混成一团。</small>
+        <small>当前结果会聚合 arXiv、PubMed 和 OpenAlex；其中 OpenAlex 只负责快速发现，阅读时会自动解析到可读源。</small>
       </section>
 
       <section className="paper-assistant-box">
@@ -137,8 +140,13 @@ export default function PaperSearchPanel({
           <span>检索结果</span>
         </div>
         {results.length === 0 ? <div className="empty-panel">输入主题后即可检索论文</div> : null}
-        {results.map((paper) => (
-          <div key={paper.paperId} className="paper-card">
+        {results.map((paper) => {
+          const alreadyImported =
+            importedPaperIds.has(paper.paperId) ||
+            (paper.doi ? importedPaperDois.has(String(paper.doi).trim().toLowerCase()) : false);
+
+          return (
+            <div key={paper.paperId} className="paper-card">
             <div className="paper-card-header">
               <strong>{paper.title}</strong>
               <small>{formatDate(paper.published)}</small>
@@ -157,9 +165,9 @@ export default function PaperSearchPanel({
                 type="button"
                 className="mini-button"
                 onClick={() => void onImportPaper(paper.paperId)}
-                disabled={importedPaperIds.has(paper.paperId)}
+                disabled={alreadyImported}
               >
-                {importedPaperIds.has(paper.paperId) ? "已导入" : "导入引用"}
+                {alreadyImported ? "已导入" : "导入引用"}
               </button>
               {paper.abstractUrl ? (
                 <a className="mini-link-button" href={paper.abstractUrl} target="_blank" rel="noreferrer">
@@ -167,8 +175,9 @@ export default function PaperSearchPanel({
                 </a>
               ) : null}
             </div>
-          </div>
-        ))}
+            </div>
+          );
+        })}
       </section>
     </div>
   );
@@ -178,5 +187,6 @@ export default function PaperSearchPanel({
  * Code Review:
  * - 检索面板同时呈现“项目文献库”和“外部搜索结果”，能让用户明确区分已导入资产与候选论文。
  * - Agent 入口被限定在研究面板内部，避免与写作区 AI 助手混淆。
- * - 搜索、导入和打开阅读全部通过回调抛给上层，保持该组件为纯 UI 容器。
+ * - 搜索、导入和打开阅读全部通过回调抛给上层，保持该组件为纯 UI 容器；`OpenAlex` 会在后端自动解析到可读源。
+ * - 导入按钮额外用 DOI 感知已导入状态，能覆盖“discovery 结果导入后被 canonical 到 arXiv/PubMed”的场景。
  */

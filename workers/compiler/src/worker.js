@@ -28,7 +28,7 @@
  *   - packages/shared
  *
  * Last Updated:
- *   - 2026-03-08 by Codex - 增加 file-hash 编译缓存、latexmk 多轮编译和多 worker 原子领取
+ *   - 2026-03-09 by Codex - 修正缓存命中日志，避免向用户暴露历史原始编译输出
  */
 
 import { spawn } from "node:child_process";
@@ -40,7 +40,6 @@ import {
   buildCompileCacheKey,
   ensureCompileCacheStorage,
   getCompileCacheEntry,
-  readCompileCacheLog,
   writeCompileCacheEntry,
 } from "../../../packages/runtime-store/src/compile-cache.js";
 import { DEFAULT_COMPILE_ENGINE, SNAPSHOT_TYPE } from "../../../packages/contracts/src/index.js";
@@ -436,7 +435,6 @@ async function compileJob(job) {
 
   if (cachedEntry) {
     await fs.copyFile(cachedEntry.pdfPath, outputPdfPath);
-    const cachedLog = await readCompileCacheLog(cachedEntry);
     const cacheLog = [
       `Worker ID: ${workerId}`,
       `Execution Mode: cache`,
@@ -444,7 +442,8 @@ async function compileJob(job) {
       `Root File: ${rootFile}`,
       `Cache Key: ${cacheKey}`,
       "",
-      cachedLog || "Compile cache hit.",
+      "命中编译缓存，已直接复用最近一次成功编译的 PDF 产物。",
+      "当前任务未重新执行 LaTeX 引擎，因此这里不展示历史原始编译输出。",
     ].join("\n");
     await markCompileJobSucceeded(job.id, {
       log: cacheLog,
@@ -707,4 +706,5 @@ if (isMainModule) {
  * - 目标引擎不存在时返回明确日志而不是静默失败，保证当前环境下也能验证任务链路是否打通。
  * - 任务执行异常时会回写失败状态，避免任务长期停留在 `running`。
  * - 成功编译后的快照直接基于编译工作区创建，避免快照内容和实际成功编译版本发生漂移。
+ * - 缓存命中时只返回当前任务的缓存摘要，不再把历史原始编译日志整段拼给用户，避免把成功结果展示成噪声。
  */

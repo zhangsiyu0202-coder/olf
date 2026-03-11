@@ -14,16 +14,18 @@
  *
  * Dependencies:
  *   - node:child_process
+ *   - node:fs
  *   - node:path
  *   - packages/shared/env
  *   - packages/shared/fs
  *   - packages/shared/paths
  *
  * Last Updated:
- *   - 2026-03-08 by Codex - 升级为支持多源论文与独立 HTTP 服务的主站封装层
+ *   - 2026-03-11 by Codex - 新增结构化论文报告生成封装
  */
 
 import { spawn } from "node:child_process";
+import { existsSync } from "node:fs";
 import path from "node:path";
 import { loadEnvFile } from "../../shared/src/env.js";
 import { ensureDir, fileExists, writeBinary } from "../../shared/src/fs.js";
@@ -33,9 +35,14 @@ import { getPaperPdfCachePath, repositoryRoot, runtimePapersRoot } from "../../s
 loadEnvFile();
 
 const paperScriptPath = path.join(repositoryRoot, "packages", "paper-assistant", "src", "paper_tools.py");
-const paperPythonPath = process.env.PAPER_ASSISTANT_PYTHON?.trim() || path.join(repositoryRoot, ".venv", "bin", "python");
+const dedicatedPaperPythonPath = path.join(repositoryRoot, ".venv-paper-service", "bin", "python");
+const sharedPaperPythonPath = path.join(repositoryRoot, ".venv", "bin", "python");
+const paperPythonPath =
+  process.env.PAPER_ASSISTANT_PYTHON?.trim() ||
+  (existsSync(dedicatedPaperPythonPath) ? dedicatedPaperPythonPath : sharedPaperPythonPath);
 const paperToolTimeoutMs = Number(process.env.PAPER_ASSISTANT_TIMEOUT_MS ?? 60000);
 const paperAssistantBaseUrl = String(process.env.PAPER_ASSISTANT_BASE_URL ?? "").trim().replace(/\/+$/, "");
+const defaultPaperSearchLimit = 200;
 
 function normalizePaperId(paperId) {
   return normalizePaperReference(paperId);
@@ -149,26 +156,24 @@ async function runPaperTool(payload) {
   });
 }
 
-export async function searchPapers(query, limit = 6, sources = []) {
+export async function searchPapers(query, limit = defaultPaperSearchLimit, sources = []) {
   if (paperAssistantBaseUrl) {
-    return (await fetchPaperServiceJson("/v1/search", {
+    return await fetchPaperServiceJson("/v1/search", {
       method: "POST",
       body: {
         query,
         limit,
         sources,
       },
-    })).results ?? [];
+    });
   }
 
-  const payload = await runPaperTool({
+  return await runPaperTool({
     action: "search",
     query,
     limit,
     sources,
   });
-
-  return payload.results ?? [];
 }
 
 export async function loadPaperDetails(paperId, maxChars = 18000) {
@@ -192,6 +197,51 @@ export async function loadPaperDetails(paperId, maxChars = 18000) {
   });
 
   return payload.paper;
+}
+
+export async function loadPaperMetadata(paperId, maxChars = 6000) {
+  const normalizedPaperId = normalizePaperId(paperId);
+
+  if (paperAssistantBaseUrl) {
+    const payload = await fetchPaperServiceJson(`/v1/paper-metadata/${encodeURIComponent(normalizedPaperId)}`, {
+      method: "GET",
+      body: null,
+      query: new URLSearchParams({
+        max_chars: String(maxChars),
+      }).toString(),
+    });
+    return payload.paper;
+  }
+
+  const payload = await runPaperTool({
+    action: "metadata",
+    paperId: normalizedPaperId,
+    maxChars,
+  });
+
+  return payload.paper;
+}
+
+export async function generatePaperReport(paperId, { maxChars = 24000, language = "zh-CN" } = {}) {
+  const normalizedPaperId = normalizePaperId(paperId);
+
+  if (paperAssistantBaseUrl) {
+    return fetchPaperServiceJson("/v1/reports/generate", {
+      method: "POST",
+      body: {
+        paperId: normalizedPaperId,
+        maxChars,
+        language,
+      },
+    });
+  }
+
+  return runPaperTool({
+    action: "report_generate",
+    paperId: normalizedPaperId,
+    maxChars,
+    language,
+  });
 }
 
 export async function generatePaperBibtex(paperId) {
@@ -266,5 +316,8 @@ export async function ensurePaperPdfCached(paperId) {
  * Code Review:
  * - 主站封装层优先走独立 HTTP 论文服务，只有在未配置远端服务时才回退本地 CLI，能让大陆主站和香港论文服务保持清晰分工。
  * - 多源论文 ID 已统一交给共享工具解析，避免继续把 `paperId` 默认等同于 arXiv 裸 ID。
+ * - 本地回退解释器优先指向 `.venv-paper-service`，能把论文服务和共享 `.venv` 中的可选 AI 依赖冲突隔离开，同时仍保留 `PAPER_ASSISTANT_PYTHON` 的显式覆盖口。
  * - PDF 仍在主站侧做本地缓存，保证前端阅读面板不会因反复切换论文而重复命中远端论文源或香港服务。
+ * - 默认搜索规模也必须在 Node 封装层同步放大，否则前端和 Python 侧即便都改了，这里仍会把未显式传参的请求压回旧值。
+ * - 报告生成入口在 Node 层保持“远端优先 + 本地 CLI 回退”一致语义，避免不同部署形态下出现行为漂移。
  */

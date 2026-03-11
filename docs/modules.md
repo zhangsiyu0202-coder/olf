@@ -119,8 +119,8 @@
 职责：
 
 - 承载论文源适配、搜索聚合、全文加载、BibTeX 生成和研究场景 Agent 能力
-- 通过 Python LangChain 工具统一封装不同论文源，而不是把具体源规则散落到 API 或前端
-- 当前已落地 `arXiv / Semantic Scholar / PubMed` 多源搜索，并在同一边界内统一处理详情、BibTeX 与 PDF 获取
+- 通过 Python adapter + 官方 API / 原生包统一封装不同论文源，而不是把具体源规则散落到 API 或前端
+- 当前已落地 `arXiv / PubMed / OpenAlex` 三源搜索，并在同一边界内统一处理 discovery 解析、详情、BibTeX 与 PDF 获取
 - 为 API 提供稳定的论文能力封装，而不是直接暴露给前端
 - 为独立论文搜索服务提供可复用的核心能力和 FastAPI 应用
 
